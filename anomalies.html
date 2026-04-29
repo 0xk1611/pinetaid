@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}PiNetAid – Anomalies{% endblock %}
+
+{% block content %}
+<h1>⚠ Anomaly Detection</h1>
+
+{% if not flagged %}
+<div class="card" style="text-align:center;padding:2.5rem;color:var(--muted);">
+  <div style="font-size:2.5rem;margin-bottom:.6rem;">✅</div>
+  <div style="font-size:1rem;margin-bottom:.3rem;color:var(--text);">No anomalies detected</div>
+  <div style="font-size:.85rem;">
+    <a href="{{ url_for('home') }}">Run an AI analysis from the Devices page.</a>
+  </div>
+</div>
+{% else %}
+<div class="card" style="padding:0;overflow:hidden;margin-bottom:1.1rem;">
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>IP Address</th>
+          <th>MAC Address</th>
+          <th>Vendor / Type</th>
+          <th>Subnet</th>
+          <th>Anomaly Score</th>
+          <th>Last Seen</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for d in flagged %}
+        <tr>
+          <td><code style="font-size:.85rem">{{ d.ip }}</code></td>
+          <td><code style="font-size:.76rem;color:var(--muted)">{{ d.mac }}</code></td>
+          <td>{{ d.vendor }}</td>
+          <td><span class="badge badge-blue" style="font-family:monospace;font-size:.72rem">
+            {{ d.subnet or '—' }}</span></td>
+          <td>
+            {% set score = d.anomaly_score | float %}
+            {# More negative = more anomalous #}
+            {% if score < -0.15 %}
+              <span class="badge badge-red">🔴 {{ "%.4f"|format(score) }}</span>
+            {% elif score < 0 %}
+              <span class="badge badge-orange">🟠 {{ "%.4f"|format(score) }}</span>
+            {% else %}
+              <span class="badge badge-yellow">🟡 {{ "%.4f"|format(score) }}</span>
+            {% endif %}
+          </td>
+          {# TASK 4: data-ts for JS time-ago conversion #}
+          <td data-ts="{{ d.last_seen }}" style="font-size:.82rem;color:var(--muted)">
+            {{ d.last_seen }}
+          </td>
+          <td>
+            <button class="btn btn-outline btn-sm" onclick="clearFlag('{{ d.mac }}')">
+              ✕ Clear
+            </button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<h2>Recent AI Run Results</h2>
+<div class="card" style="padding:0;overflow:hidden;">
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr><th>Timestamp</th><th>Model</th><th>Device MAC</th><th>Result</th></tr>
+      </thead>
+      <tbody>
+        {% for r in ai_results %}
+        <tr>
+          <td data-ts="{{ r.run_at }}" style="font-size:.8rem;color:var(--muted)">{{ r.run_at }}</td>
+          <td><span class="badge badge-blue">{{ r.model }}</span></td>
+          <td><code style="font-size:.78rem">{{ r.device_mac or '—' }}</code></td>
+          <td style="font-size:.77rem;color:var(--muted);max-width:280px;
+                     overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+              title="{{ r.result }}">{{ r.result }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="4" style="color:var(--muted);text-align:center;padding:1.5rem">
+            No AI runs recorded yet.
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function clearFlag(mac) {
+  const data = await apiPost('/api/flag', {mac, flagged: false});
+  if (data.success) { location.reload(); }
+  else showToast('Failed to clear flag', false);
+}
+
+// TASK 3: refreshPage() stub so base interval doesn't error
+async function refreshPage() { location.reload(); }
+
+// TASK 4: apply on load
+applyTimeAgo();
+</script>
+{% endblock %}

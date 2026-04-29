@@ -1,0 +1,278 @@
+{% extends "base.html" %}
+{% block title %}PiNetAid – Devices{% endblock %}
+
+{% block content %}
+{# TASK 5/6: vendor icon macro — must be defined INSIDE the block before first use #}
+{% macro _vendor_icon(vendor) -%}
+  {%- set v = vendor | lower -%}
+  {%- if 'cisco' in v or 'netgear' in v or 'tp-link' in v or 'asus' in v or 'ubiquiti' in v or 'linksys' in v or 'huawei' in v -%}🌐
+  {%- elif 'apple' in v -%}🍎
+  {%- elif 'samsung' in v or 'xiaomi' in v or 'oneplus' in v -%}📱
+  {%- elif 'raspberry' in v or 'espressif' in v -%}🔧
+  {%- elif 'amazon' in v or 'google' in v or 'sonos' in v or 'philips' in v or 'roku' in v -%}🏠
+  {%- elif 'dell' in v or 'hp' in v or 'lenovo' in v or 'microsoft' in v or 'intel' in v -%}💻
+  {%- elif 'sony' in v or 'nintendo' in v -%}🎮
+  {%- elif 'vm' in v or 'virtual' in v -%}🖥
+  {%- elif 'iot' in v -%}📟
+  {%- elif 'mobile' in v -%}📱
+  {%- elif 'network' in v -%}🌐
+  {%- else -%}❓
+  {%- endif -%}
+{%- endmacro %}
+<h1>🖥 Network Devices</h1>
+
+<!-- ── Stat cards ─────────────────────────────────────────────────────── -->
+<div class="stats-row">
+  <div class="stat blue">
+    <div class="stat-icon">📡</div>
+    <div class="value" id="stat-total">{{ stats.total_devices }}</div>
+    <div class="label">Devices{% if current_subnet %} on {{ current_subnet }}{% endif %}</div>
+  </div>
+  <div class="stat red">
+    <div class="stat-icon">⚠</div>
+    <div class="value" id="stat-flagged">{{ stats.flagged_devices }}</div>
+    <div class="label">Anomalies</div>
+  </div>
+  <div class="stat green">
+    <div class="stat-icon">🤖</div>
+    <div class="value" id="stat-ai">{{ stats.ai_runs }}</div>
+    <div class="label">AI Runs</div>
+  </div>
+  <div class="stat">
+    <div class="stat-icon">📋</div>
+    <div class="value" id="stat-logs">{{ stats.total_logs }}</div>
+    <div class="label">Log Entries</div>
+  </div>
+</div>
+
+<!-- ── Toolbar ────────────────────────────────────────────────────────── -->
+<div style="display:flex;gap:.65rem;margin-bottom:1.1rem;flex-wrap:wrap;align-items:center;">
+  <button class="btn btn-primary" onclick="runAnalysis()">🤖 Run AI Analysis</button>
+  <button class="btn btn-outline"  onclick="refreshPage()">↺ Refresh</button>
+  <button class="btn btn-outline"  onclick="showDiagModal()">🔍 Diagnose IP</button>
+
+  <!-- TASK 1: subnet selector -->
+  {% if all_subnets|length > 1 %}
+  <div style="display:flex;align-items:center;gap:.4rem;font-size:.82rem;color:var(--muted);margin-left:.25rem;">
+    🌐 Subnet:
+    <select id="subnet-select" onchange="switchSubnet(this.value)"
+            style="background:var(--bg);border:1px solid var(--border);color:var(--text);
+                   border-radius:6px;padding:.22rem .5rem;font-size:.82rem;cursor:pointer;">
+      <option value="">All subnets</option>
+      {% for s in all_subnets %}
+      <option value="{{ s }}" {% if s == current_subnet %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  {% elif current_subnet %}
+  <span class="badge badge-blue" style="margin-left:.25rem;">🌐 {{ current_subnet }}</span>
+  {% endif %}
+
+  <button class="btn btn-outline" onclick="retrainModels()" style="margin-left:auto;">
+    ⟳ Retrain Models
+  </button>
+</div>
+
+<!-- ── Device table ───────────────────────────────────────────────────── -->
+<div class="card" style="padding:0;overflow:hidden;">
+  <div class="tbl-wrap">
+    <table id="device-table">
+      <thead>
+        <tr>
+          <th>IP Address</th>
+          <th>MAC Address</th>
+          <th>Vendor / Type</th>
+          <th>Subnet</th>
+          <th>Last Seen</th>
+          <th>Status</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="device-tbody">
+        {% for d in devices %}
+        <tr data-mac="{{ d.mac }}">
+          <td><code style="font-size:.85rem;">{{ d.ip }}</code></td>
+          <td><code style="font-size:.76rem;color:var(--muted)">{{ d.mac }}</code></td>
+          <td>
+            <span style="display:flex;align-items:center;gap:.35rem;">
+              {{ _vendor_icon(d.vendor) }} {{ d.vendor }}
+            </span>
+          </td>
+          <td><span class="badge badge-blue" style="font-family:monospace;font-size:.72rem;">
+            {{ d.subnet or '—' }}
+          </span></td>
+          {# TASK 4: store raw timestamp in data-ts, JS will convert to "Xm ago" #}
+          <td data-ts="{{ d.last_seen }}" style="font-size:.82rem;color:var(--muted)">
+            {{ d.last_seen }}
+          </td>
+          <td>
+            {% if d.is_flagged %}
+              <span class="badge badge-red">⚠ Anomaly</span>
+            {% else %}
+              <span class="badge badge-green">✓ Normal</span>
+            {% endif %}
+          </td>
+          <td style="display:flex;gap:.35rem;flex-wrap:wrap;">
+            <button class="btn btn-outline btn-sm" onclick="diagnose('{{ d.ip }}')">🔍</button>
+            {% if d.is_flagged %}
+            <button class="btn btn-outline btn-sm" onclick="toggleFlag('{{ d.mac }}', false)">✕ Clear</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="7" style="color:var(--muted);text-align:center;padding:2.5rem;">
+            No devices detected yet — capture is running in the background.
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── Diagnostic modal ────────────────────────────────────────────────── -->
+<div id="diag-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);
+     z-index:100;align-items:center;justify-content:center;">
+  <div class="card" style="width:100%;max-width:540px;position:relative;margin:0 1rem;">
+    <button onclick="closeDiagModal()"
+            style="position:absolute;top:.75rem;right:.85rem;background:none;
+                   border:none;color:var(--muted);font-size:1.2rem;cursor:pointer;">✕</button>
+    <h2>🔍 Run Diagnostics</h2>
+    <div style="display:flex;gap:.5rem;margin-top:.9rem;">
+      <input id="diag-ip" type="text" placeholder="192.168.1.1" style="flex:1;">
+      <button class="btn btn-primary" onclick="runDiagnostics()">Run</button>
+    </div>
+    <pre id="diag-result" style="display:none;margin-top:.9rem;background:var(--bg);
+         border:1px solid var(--border);border-radius:var(--radius);padding:.75rem;
+         font-size:.77rem;overflow:auto;max-height:340px;"></pre>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Active subnet (read from URL or page variable)
+let activeSubnet = "{{ current_subnet or '' }}";
+
+function switchSubnet(val) {
+  activeSubnet = val;
+  const url = val ? `/?subnet=${encodeURIComponent(val)}` : '/';
+  window.location.href = url;  // reload with subnet param
+}
+
+// ── Device table refresh (called by base.html interval) ──────────────────────
+async function refreshPage() {
+  const qs  = activeSubnet ? `?subnet=${encodeURIComponent(activeSubnet)}` : '';
+  const [devices, stats] = await Promise.all([
+    fetch(`/api/devices${qs}`).then(r => r.json()),
+    fetch(`/api/stats${qs}`).then(r => r.json()),
+  ]);
+
+  // Update stat counters
+  document.getElementById('stat-total').textContent   = stats.total_devices;
+  document.getElementById('stat-flagged').textContent = stats.flagged_devices;
+  document.getElementById('stat-ai').textContent      = stats.ai_runs;
+  document.getElementById('stat-logs').textContent    = stats.total_logs;
+
+  // Re-render device rows
+  const tbody = document.getElementById('device-tbody');
+  if (!devices.length) {
+    tbody.innerHTML = `<tr><td colspan="7" style="color:var(--muted);text-align:center;padding:2.5rem">
+      No devices detected yet — capture is running in the background.</td></tr>`;
+    markUpdated();
+    return;
+  }
+
+  tbody.innerHTML = devices.map(d => `
+    <tr data-mac="${d.mac}">
+      <td><code style="font-size:.85rem">${d.ip}</code></td>
+      <td><code style="font-size:.76rem;color:var(--muted)">${d.mac}</code></td>
+      <td>${vendorIcon(d.vendor)} ${d.vendor}</td>
+      <td><span class="badge badge-blue" style="font-family:monospace;font-size:.72rem">
+        ${d.subnet || '—'}</span></td>
+      <td data-ts="${d.last_seen}" style="font-size:.82rem;color:var(--muted)">${d.last_seen}</td>
+      <td>${d.is_flagged
+        ? '<span class="badge badge-red">⚠ Anomaly</span>'
+        : '<span class="badge badge-green">✓ Normal</span>'}</td>
+      <td style="display:flex;gap:.35rem;flex-wrap:wrap">
+        <button class="btn btn-outline btn-sm" onclick="diagnose('${d.ip}')">🔍</button>
+        ${d.is_flagged
+          ? `<button class="btn btn-outline btn-sm" onclick="toggleFlag('${d.mac}',false)">✕ Clear</button>`
+          : ''}
+      </td>
+    </tr>`).join('');
+
+  applyTimeAgo();  // TASK 4: convert timestamps to "Xm ago"
+  markUpdated();   // TASK 3: update "last updated" clock in navbar
+}
+
+// TASK 5: simple vendor → emoji icon (JS mirror of Jinja helper below)
+function vendorIcon(vendor) {
+  if (!vendor) return '❓';
+  const v = vendor.toLowerCase();
+  if (v.includes('cisco') || v.includes('netgear') || v.includes('tp-link') ||
+      v.includes('asus')  || v.includes('linksys') || v.includes('ubiquiti') ||
+      v.includes('huawei')) return '🌐';
+  if (v.includes('apple'))  return '🍎';
+  if (v.includes('samsung') || v.includes('xiaomi') || v.includes('oneplus')) return '📱';
+  if (v.includes('raspberry') || v.includes('espressif')) return '🔧';
+  if (v.includes('amazon') || v.includes('google') || v.includes('sonos') ||
+      v.includes('philips') || v.includes('roku'))  return '🏠';
+  if (v.includes('dell') || v.includes('hp') || v.includes('lenovo') ||
+      v.includes('microsoft') || v.includes('intel')) return '💻';
+  if (v.includes('sony') || v.includes('nintendo')) return '🎮';
+  if (v.includes('vm') || v.includes('virtual'))  return '🖥';
+  if (v.includes('iot'))   return '📟';
+  if (v.includes('mobile')) return '📱';
+  if (v.includes('network')) return '🌐';
+  return '❓';
+}
+
+async function runAnalysis() {
+  showToast('🤖 Running AI analysis…');
+  const data = await apiPost('/api/analyze');
+  if (data.success) {
+    const r = data.result;
+    showToast(`✅ Done: ${r.device_count} devices, ${r.anomalies.length} anomalies`);
+    refreshPage();
+  } else {
+    showToast(data.error || 'Analysis failed', false);
+  }
+}
+
+async function retrainModels() {
+  const data = await apiPost('/api/retrain');
+  showToast(data.message || 'Models cleared.');
+}
+
+async function toggleFlag(mac, flagged) {
+  const data = await apiPost('/api/flag', {mac, flagged});
+  if (data.success) { refreshPage(); showToast('Flag updated.'); }
+}
+
+function showDiagModal() {
+  document.getElementById('diag-modal').style.display = 'flex';
+  document.getElementById('diag-ip').focus();
+}
+function closeDiagModal() {
+  document.getElementById('diag-modal').style.display = 'none';
+}
+function diagnose(ip) {
+  document.getElementById('diag-ip').value = ip;
+  showDiagModal();
+}
+async function runDiagnostics() {
+  const ip = document.getElementById('diag-ip').value.trim();
+  if (!ip) return;
+  const pre = document.getElementById('diag-result');
+  pre.style.display = 'block';
+  pre.textContent = 'Running…';
+  const data = await apiPost('/api/diagnose', {ip});
+  pre.textContent = JSON.stringify(data.report || data, null, 2);
+}
+
+// Apply time-ago on initial server-rendered rows
+applyTimeAgo();
+</script>
+{% endblock %}

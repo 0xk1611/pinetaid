@@ -1,0 +1,5 @@
+flask>=3.0
+scapy>=2.5
+scikit-learn>=1.4
+numpy>=1.26
+bcrypt>=4.1

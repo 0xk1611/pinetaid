@@ -1,0 +1,31 @@
+[Unit]
+Description=PiNetAid – Offline Network Monitor
+After=network.target
+Wants=network.target
+
+[Service]
+# ── Edit these two lines to match your setup ──────────────────────────────
+# Full path to your project directory
+WorkingDirectory=/home/pi/pinetaid
+
+# Network interface to capture on (eth0 for wired, wlan0 for Wi-Fi)
+# Add --no-capture if you only want the dashboard without packet capture
+ExecStart=/usr/bin/python3 /home/pi/pinetaid/main.py --interface eth0
+# ──────────────────────────────────────────────────────────────────────────
+
+User=root
+Group=root
+
+# Restart automatically if it crashes
+Restart=on-failure
+RestartSec=5
+
+# Log to systemd journal (view with: journalctl -u pinetaid -f)
+StandardOutput=journal
+StandardError=journal
+
+# Keep environment clean
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}PiNetAid – Logs{% endblock %}
+
+{% block content %}
+<h1>📋 Event Log</h1>
+
+<div style="display:flex;gap:.5rem;margin-bottom:1rem;flex-wrap:wrap;align-items:center;">
+  <span style="font-size:.82rem;color:var(--muted);">Filter:</span>
+  <a href="{{ url_for('logs') }}"
+     class="badge {% if not selected_source %}badge-green{% else %}badge-blue' %}{% endif %}"
+     style="cursor:pointer;text-decoration:none;">All</a>
+  {% for src, icon in [('system','⚙'),('capture','📡'),('ai','🤖'),('dashboard','🖥')] %}
+  <a href="{{ url_for('logs', source=src) }}"
+     class="badge {% if selected_source==src %}badge-green{% else %}badge-blue{% endif %}"
+     style="cursor:pointer;text-decoration:none;">{{ icon }} {{ src }}</a>
+  {% endfor %}
+</div>
+
+<div class="card" style="padding:0;overflow:hidden;">
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Level</th><th>Source</th><th>Message</th></tr>
+      </thead>
+      <tbody>
+        {% for entry in logs %}
+        <tr>
+          {# TASK 4: data-ts for JS time-ago #}
+          <td data-ts="{{ entry.timestamp }}"
+              style="font-size:.78rem;color:var(--muted);white-space:nowrap">
+            {{ entry.timestamp }}
+          </td>
+          <td>
+            <span class="badge
+              {% if entry.level=='ERROR' %}badge-red
+              {% elif entry.level=='WARN' %}badge-yellow
+              {% else %}badge-blue{% endif %}">
+              {% if entry.level=='ERROR' %}🔴
+              {% elif entry.level=='WARN' %}🟡
+              {% else %}🔵{% endif %}
+              {{ entry.level }}
+            </span>
+          </td>
+          <td style="font-size:.8rem;color:var(--muted);">
+            {% if entry.source == 'ai' %}🤖
+            {% elif entry.source == 'capture' %}📡
+            {% elif entry.source == 'dashboard' %}🖥
+            {% else %}⚙{% endif %}
+            {{ entry.source }}
+          </td>
+          <td style="font-size:.85rem;">{{ entry.message }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="4" style="color:var(--muted);text-align:center;padding:2rem">
+            No log entries found.
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// TASK 3: refreshPage() reloads logs with current filter preserved
+function refreshPage() { location.reload(); }
+// TASK 4: apply on load
+applyTimeAgo();
+</script>
+{% endblock %}

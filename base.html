@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}PiNetAid{% endblock %}</title>
+  <style>
+    :root {
+      --bg:       #0d1117;
+      --surface:  #161b22;
+      --surface2: #1c2128;
+      --border:   #30363d;
+      --text:     #e6edf3;
+      --muted:    #8b949e;
+      --accent:   #58a6ff;
+      --green:    #3fb950;
+      --red:      #f85149;
+      --yellow:   #d29922;
+      --orange:   #e3751c;
+      --radius:   8px;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg); color: var(--text);
+      min-height: 100vh; display: flex; flex-direction: column;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── Nav ───────────────────────────────────────────────────── */
+    nav {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 1.5rem;
+      height: 52px;
+      display: flex; align-items: center; gap: 1.1rem;
+      position: sticky; top: 0; z-index: 50;
+    }
+    .nav-brand {
+      font-weight: 700; font-size: 1.05rem; color: var(--accent);
+      letter-spacing: 0.5px; white-space: nowrap;
+    }
+    .nav-brand span { color: var(--text); }
+
+    /* nav links */
+    .nav-links { display: flex; gap: 0.2rem; }
+    .nav-links a {
+      display: flex; align-items: center; gap: 0.3rem;
+      color: var(--muted); font-size: 0.875rem;
+      padding: 0.35rem 0.6rem; border-radius: 6px;
+      transition: background 0.15s, color 0.15s;
+    }
+    .nav-links a:hover { color: var(--text); background: rgba(255,255,255,0.06); text-decoration: none; }
+    .nav-links a.active { color: var(--accent); background: rgba(88,166,255,0.1); }
+
+    /* TASK 2: capture status pill */
+    #capture-pill {
+      display: flex; align-items: center; gap: 0.4rem;
+      font-size: 0.76rem; padding: 0.22rem 0.6rem;
+      border-radius: 20px; border: 1px solid var(--border);
+      cursor: pointer; transition: border-color .2s, color .2s;
+      white-space: nowrap; user-select: none;
+    }
+    #capture-pill.running { border-color: var(--green); color: var(--green); }
+    #capture-pill.stopped { border-color: var(--muted); color: var(--muted); }
+    #capture-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    #capture-pill.running #capture-dot { animation: blink 1.4s infinite; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
+
+    .nav-spacer { flex: 1; min-width: 0; }
+
+    /* TASK 3: refresh selector */
+    .nav-refresh {
+      display: flex; align-items: center; gap: 0.4rem;
+      font-size: 0.76rem; color: var(--muted); white-space: nowrap;
+    }
+    .nav-refresh select {
+      background: var(--bg); border: 1px solid var(--border);
+      color: var(--text); border-radius: 6px;
+      padding: 0.18rem 0.4rem; font-size: 0.76rem; cursor: pointer;
+    }
+    #last-updated { font-size: 0.7rem; color: var(--muted); }
+
+    .nav-user { font-size: 0.78rem; color: var(--muted); white-space: nowrap; }
+    .btn-logout {
+      background: none; border: 1px solid var(--border);
+      color: var(--muted); padding: 0.2rem 0.6rem;
+      border-radius: 6px; cursor: pointer; font-size: 0.76rem;
+    }
+    .btn-logout:hover { color: var(--red); border-color: var(--red); }
+
+    /* TASK 7.2: access URL sub-bar */
+    #access-bar {
+      background: var(--surface2); border-bottom: 1px solid var(--border);
+      padding: 0.35rem 1.5rem; font-size: 0.76rem; color: var(--muted);
+      display: none; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+    }
+    .url-chip {
+      display: inline-flex; align-items: center; gap: 0.25rem;
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 5px; padding: 0.1rem 0.55rem;
+      font-family: monospace; font-size: 0.78rem; color: var(--accent);
+    }
+    #mdns-warn { color: var(--yellow); display: none; align-items: center; gap: 0.3rem; }
+
+    /* ── Layout ──────────────────────────────────────────────── */
+    main { flex: 1; padding: 1.5rem; max-width: 1260px; width: 100%; margin: 0 auto; }
+    h1   { font-size: 1.3rem; margin-bottom: 1.1rem; }
+    h2   { font-size: 1rem; margin-bottom: 0.7rem; color: var(--muted); }
+
+    /* ── Cards ──────────────────────────────────────────────── */
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 1.1rem 1.3rem; margin-bottom: 1rem;
+    }
+
+    /* ── Stat chips ─────────────────────────────────────────── */
+    .stats-row { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.25rem; }
+    .stat {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 0.85rem 1.2rem;
+      min-width: 130px; flex: 1; transition: border-color .2s;
+    }
+    .stat:hover { border-color: rgba(88,166,255,.4); }
+    .stat-icon  { font-size: 1.1rem; margin-bottom: 0.25rem; }
+    .stat .value { font-size: 1.85rem; font-weight: 700; line-height: 1; }
+    .stat .label {
+      font-size: 0.7rem; color: var(--muted); margin-top: 4px;
+      text-transform: uppercase; letter-spacing: .5px;
+    }
+    .stat.red    .value { color: var(--red); }
+    .stat.green  .value { color: var(--green); }
+    .stat.blue   .value { color: var(--accent); }
+    .stat.yellow .value { color: var(--yellow); }
+
+    /* ── Table ──────────────────────────────────────────────── */
+    .tbl-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+    th, td { padding: 0.6rem 0.8rem; text-align: left; }
+    th {
+      border-bottom: 1px solid var(--border);
+      color: var(--muted); font-weight: 600;
+      font-size: 0.75rem; text-transform: uppercase; letter-spacing: .5px;
+    }
+    tr + tr td { border-top: 1px solid rgba(48,54,61,.6); }
+    tr:hover td { background: rgba(255,255,255,0.022); }
+
+    /* ── Badges ─────────────────────────────────────────────── */
+    .badge {
+      display: inline-flex; align-items: center; gap: 0.2rem;
+      padding: 0.14rem 0.55rem; border-radius: 20px;
+      font-size: 0.74rem; font-weight: 600;
+    }
+    .badge-red    { background: rgba(248,81,73,.15);  color: var(--red); }
+    .badge-green  { background: rgba(63,185,80,.15);  color: var(--green); }
+    .badge-blue   { background: rgba(88,166,255,.15); color: var(--accent); }
+    .badge-yellow { background: rgba(210,153,34,.15); color: var(--yellow); }
+    .badge-orange { background: rgba(227,117,28,.15); color: var(--orange); }
+
+    /* ── Buttons ─────────────────────────────────────────────── */
+    .btn {
+      display: inline-flex; align-items: center; gap: 0.3rem;
+      padding: 0.42rem 0.95rem; border-radius: var(--radius);
+      font-size: 0.85rem; cursor: pointer; border: none;
+      transition: opacity .15s, transform .1s;
+    }
+    .btn:active { transform: scale(.97); }
+    .btn:hover  { opacity: .85; }
+    .btn-primary { background: var(--accent); color: #000; font-weight: 600; }
+    .btn-danger  { background: var(--red);    color: #fff; }
+    .btn-outline { background: none; border: 1px solid var(--border); color: var(--text); }
+    .btn-sm { padding: 0.2rem 0.55rem; font-size: 0.76rem; }
+
+    /* ── Toast ──────────────────────────────────────────────── */
+    #toast {
+      position: fixed; bottom: 1.5rem; right: 1.5rem;
+      background: var(--surface2); border: 1px solid var(--border);
+      padding: 0.7rem 1.2rem; border-radius: var(--radius);
+      font-size: 0.875rem; box-shadow: 0 4px 28px rgba(0,0,0,.5);
+      opacity: 0; transform: translateY(8px);
+      transition: opacity .25s, transform .25s;
+      pointer-events: none; max-width: 340px; z-index: 9999;
+    }
+    #toast.show { opacity: 1; transform: translateY(0); }
+  </style>
+</head>
+<body>
+
+{% if session.get('logged_in') %}
+<nav>
+  <span class="nav-brand">🔬 Pi<span>Net</span>Aid</span>
+
+  <div class="nav-links">
+    <a href="{{ url_for('home') }}" {% if request.endpoint=='home' %}class="active"{% endif %}>
+      🖥 Devices
+    </a>
+    <a href="{{ url_for('anomalies') }}" {% if request.endpoint=='anomalies' %}class="active"{% endif %}>
+      ⚠ Anomalies
+    </a>
+    <a href="{{ url_for('logs') }}" {% if request.endpoint=='logs' %}class="active"{% endif %}>
+      📋 Logs
+    </a>
+  </div>
+
+  <!-- TASK 2: capture status pill, clickable to start/stop -->
+  <div id="capture-pill" class="stopped" onclick="toggleCapture()" title="Click to toggle capture">
+    <span id="capture-dot"></span>
+    <span id="capture-label">Stopped</span>
+  </div>
+
+  <div class="nav-spacer"></div>
+
+  <!-- TASK 3: global auto-refresh selector, saved to localStorage -->
+  <div class="nav-refresh">
+    ↺
+    <select id="refresh-select" onchange="applyRefreshInterval(this.value)">
+      <option value="5000">5s</option>
+      <option value="30000">30s</option>
+      <option value="60000">1 min</option>
+    </select>
+    <span id="last-updated"></span>
+  </div>
+
+  <span class="nav-user">👤 {{ session.username }}</span>
+  <a href="{{ url_for('logout') }}"><button class="btn-logout">Logout</button></a>
+</nav>
+
+<!-- TASK 7.2/7.3: access URL bar (JS-populated from /api/status) -->
+<div id="access-bar">
+  <span>🌐 Access via:</span>
+  <span class="url-chip" id="url-ip"></span>
+  <span class="url-chip" id="url-mdns"></span>
+  <span id="mdns-warn">⚠ mDNS not active — use IP address above</span>
+</div>
+{% endif %}
+
+<main>{% block content %}{% endblock %}</main>
+<div id="toast"></div>
+
+<script>
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function showToast(msg, ok=true) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.borderColor = ok ? 'var(--green)' : 'var(--red)';
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3500);
+}
+
+async function apiPost(url, body={}) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  return r.json();
+}
+
+// ── TASK 4: human-readable "N ago" timestamps ────────────────────────────────
+function timeAgo(ts) {
+  if (!ts) return '—';
+  const dt  = new Date(ts.replace(' ', 'T') + 'Z');  // treat DB value as UTC
+  const sec = Math.floor((Date.now() - dt.getTime()) / 1000);
+  if (isNaN(sec) || sec < 5)  return 'just now';
+  if (sec < 60)               return `${sec}s ago`;
+  if (sec < 3600)             return `${Math.floor(sec/60)}m ago`;
+  if (sec < 86400)            return `${Math.floor(sec/3600)}h ago`;
+  return `${Math.floor(sec/86400)}d ago`;
+}
+// Call after rendering any table with [data-ts] attributes
+function applyTimeAgo() {
+  document.querySelectorAll('[data-ts]').forEach(el => {
+    el.textContent = timeAgo(el.dataset.ts);
+  });
+}
+
+// ── TASK 2: capture status polling (every 2s) ─────────────────────────────────
+let _captureRunning = false;
+
+async function pollStatus() {
+  try {
+    const s = await fetch('/api/status').then(r => r.json());
+    _captureRunning = s.capture_running;
+
+    // Update pill instantly (no page reload needed)
+    const pill  = document.getElementById('capture-pill');
+    const label = document.getElementById('capture-label');
+    if (pill) {
+      pill.className    = _captureRunning ? 'running' : 'stopped';
+      label.textContent = _captureRunning ? 'Capturing' : 'Stopped';
+    }
+
+    // TASK 7.2: fill the access bar
+    const bar = document.getElementById('access-bar');
+    if (bar && s.local_ip) {
+      bar.style.display = 'flex';
+      document.getElementById('url-ip').textContent = `http://${s.local_ip}:5000`;
+      const mdnsChip = document.getElementById('url-mdns');
+      const mdnsWarn = document.getElementById('mdns-warn');
+      if (s.mdns_ok) {
+        mdnsChip.textContent    = 'http://pinetaid.local:5000';
+        mdnsChip.style.display  = 'inline-flex';
+        mdnsWarn.style.display  = 'none';
+      } else {
+        mdnsChip.style.display  = 'none';
+        mdnsWarn.style.display  = 'flex';
+      }
+    }
+  } catch(_) {}
+}
+
+async function toggleCapture() {
+  const url  = _captureRunning ? '/api/capture/stop' : '/api/capture/start';
+  const data = await apiPost(url);
+  _captureRunning = data.capture_running;
+  showToast(_captureRunning ? '▶ Capture started.' : '⏹ Capture stopped.');
+  pollStatus();
+}
+
+setInterval(pollStatus, 2000);
+pollStatus();
+
+// ── TASK 3: persistent refresh interval ─────────────────────────────────────
+let _refreshTimer = null;
+
+function applyRefreshInterval(ms) {
+  ms = parseInt(ms);
+  localStorage.setItem('pna_refresh_ms', ms);
+  if (_refreshTimer) clearInterval(_refreshTimer);
+  // refreshPage() is defined per-page; base provides a no-op default
+  if (typeof refreshPage === 'function') {
+    _refreshTimer = setInterval(refreshPage, ms);
+  }
+}
+
+function markUpdated() {
+  const el = document.getElementById('last-updated');
+  if (!el) return;
+  const n  = new Date();
+  const hh = String(n.getHours()).padStart(2,'0');
+  const mm = String(n.getMinutes()).padStart(2,'0');
+  const ss = String(n.getSeconds()).padStart(2,'0');
+  el.textContent = `${hh}:${mm}:${ss}`;
+}
+
+// Restore saved setting and kick off interval on page load
+(function initRefresh() {
+  const saved = localStorage.getItem('pna_refresh_ms') || '30000';
+  const sel   = document.getElementById('refresh-select');
+  if (sel) sel.value = saved;
+  applyRefreshInterval(saved);
+})();
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

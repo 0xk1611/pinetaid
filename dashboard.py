@@ -1,24 +1,17 @@
 """
-PiNetAid – dashboard.py
-Flask web dashboard.
+PiNetAid — dashboard.py
 
-Changes in this version:
-  TASK 1 – Removed ALL {% block body %} / {% endblock %} tags.
-           Each route calls render_page(content) — a plain Python function.
-  TASK 2 – All devices returned (no [:5] slice or LIMIT).
-  TASK 3 – Device tables auto-refresh every 5 s via lightweight fetch() AJAX.
-  TASK 4 – Anomaly page shows 'reason' column for every flagged device.
-  TASK 6 – /top-devices, /suspicious, /device-types, /export added.
-           Network Health banner on Overview.
+Flask web dashboard for the PiNetAid offline network monitor.
+All pages are assembled with render_page() and served by Flask routes.
+Device tables refresh automatically via lightweight AJAX (no page reload).
 """
 
 import json
 import logging
-import threading
 from datetime import datetime
 
 from flask import (
-    Flask, render_template_string, request,
+    Flask, request,
     redirect, url_for, session, jsonify, flash, Response,
     get_flashed_messages
 )
@@ -31,43 +24,18 @@ from capture import (
     start_capture_thread, stop_capture_thread,
     capture_is_running, get_cached_devices,
 )
-try:
-    from wifi_provision import (
-        scan_networks, connect_to_wifi, get_wifi_status,
-        start_hotspot, enable_force_hotspot, HOTSPOT_IP,
-    )
-    _WIFI_AVAILABLE = True
-except ImportError:
-    _WIFI_AVAILABLE = False
 
 logger = logging.getLogger("pinetaid.dashboard")
 
 app = Flask(__name__)
 app.secret_key = generate_secret_key()
-# Capture state is now managed inside capture.PacketCapture singleton.
-# Use capture_is_running(), start_capture_thread(), stop_capture_thread().
 
 
-# TASK 1: detect the Pi's own /24 subnet so the dashboard can auto-filter
 import socket as _socket
-from ipaddress import ip_network as _ip_network
-
-def _detect_current_subnet() -> str:
-    """Return the Pi's /24 subnet (e.g. '192.168.1.0/24'), or '' on failure."""
-    try:
-        with _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM) as s:
-            s.connect(("10.255.255.255", 1))
-            local_ip = s.getsockname()[0]
-        return str(_ip_network(f"{local_ip}/24", strict=False))
-    except Exception:
-        return ""
 
 
 def _get_active_interfaces() -> list[str]:
-    """
-    TASK 6: Return network interfaces that have an IPv4 address assigned.
-    Always includes eth0 and wlan0 as fallback options even if not found.
-    """
+    """Return network interfaces with an IPv4 address. Always includes eth0 and wlan0 as fallbacks."""
     found = []
     try:
         import subprocess
@@ -90,9 +58,9 @@ def _get_active_interfaces() -> list[str]:
 
 def _get_network_info() -> dict:
     """
-    TASK 4: Detect default gateway and interface broadcast address.
-    Uses read-only system commands — no packages needed.
-    Returns dict with keys: gateway, broadcast, local_ip  (all strings, "" on failure).
+    Detect the default gateway, broadcast address, and local IP.
+    Uses read-only system commands. Returns a dict with keys:
+    gateway, broadcast, local_ip — all strings, empty string on failure.
     """
     import subprocess, re
     info = {"gateway": "", "broadcast": "", "local_ip": ""}
@@ -170,7 +138,7 @@ tr:hover td{background:#1c2128}
 .badge-ok{background:#1a3a2a;color:var(--green)}
 .badge-bad{background:#3d1f1f;color:var(--red)}
 .badge-type{background:#1a2a3d;color:var(--blue)}
-/* Task 3: severity-level badge colours */
+/* Severity badge colours */
 .sev-critical{background:#4a0f0f;color:#ff6b6b;border:1px solid #ff6b6b}
 .sev-high{background:#3d1f1f;color:var(--red);border:1px solid var(--red)}
 .sev-medium{background:#3d2f0f;color:var(--yellow);border:1px solid var(--yellow)}
@@ -209,9 +177,9 @@ input:focus{border-color:var(--blue)}
 .nav-refresh select{background:var(--bg);color:var(--muted);border:1px solid var(--border);
   padding:2px 6px;border-radius:3px;font-size:11px;cursor:pointer;font-family:var(--font)}
 #nav-last-updated{font-size:10px;color:var(--muted);white-space:nowrap}
-/* T7: ensure no element causes horizontal overflow */
+/* Prevent horizontal overflow on small screens */
 .tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}
-.card{overflow:hidden}               /* T7: cards clip their content */
+.card{overflow:hidden}
 .mac{color:var(--yellow);font-size:11px;word-break:break-all}
 body{overflow-x:hidden}
 /* hamburger nav */
@@ -231,12 +199,12 @@ body{overflow-x:hidden}
   .login-box{width:95%;padding:22px 14px}
   .card{padding:12px}
   h1{font-size:16px;margin-bottom:14px}
-  /* T7: stack form rows on mobile */
+  /* Stack form rows on small screens */
   form[style*="grid"]{display:flex;flex-direction:column}
 }
 @media(max-width:480px){
   .stat-grid{grid-template-columns:1fr}
-  table{font-size:11px}              /* T7: smaller font on very small screens */
+  table{font-size:11px}
   th,td{padding:5px 6px}
   .stat-value{font-size:20px}
 }
@@ -250,11 +218,12 @@ def _nav(active: str) -> str:
         ("devices",      "devices",      "Devices"),
         ("anomalies",    "anomalies",    "Anomalies"),
         ("top",          "top_devices",  "Top Active"),
+        ("suspicious",   "suspicious",   "Suspicious"),
         ("device-types", "device_types", "Device Types"),
         ("diag",         "diag_page",    "Diagnostics"),
         ("capture",      "capture_page", "Capture"),
     ]
-    # TASK 6: hamburger button — toggles .nav-links.open via JS
+    # Hamburger button toggles the nav link list on small screens.
     html = ('<nav>'
             '<span class="logo">⬡ PINETAID</span>'
             '<button class="nav-hamburger" onclick="'
@@ -272,7 +241,7 @@ def _nav(active: str) -> str:
     html += ('<span id="nav-cap-pill" style="font-size:11px;color:var(--muted)">'
              '<span class="sdot sdot-r"></span>Stopped</span>')
 
-    # TASK 1/3: subnet selector — populated and persisted by JS
+    # Subnet selector — JS populates options and remembers the selection.
     html += (
         '<span style="font-size:11px;color:var(--muted)">Subnet:</span>'
         '<select id="nav-subnet-sel" onchange="PNA.setSubnet(this.value)"'
@@ -291,19 +260,11 @@ def _nav(active: str) -> str:
         '<option value="30000">30 s</option>'
         '<option value="60000">1 min</option>'
         '</select>'
-        # TASK 7: always-visible last-updated timestamp
         '<span id="nav-last-updated" style="white-space:nowrap"></span>'
         '</div>'
     )
 
-    _nb = ('font-size:11px;padding:3px 8px;border:1px solid var(--border);'
-           'border-radius:3px;color:var(--muted);text-decoration:none')
-    if _WIFI_AVAILABLE:
-        try:
-            html += f'<a href="{url_for("wifi_setup")}" style="{_nb};margin-left:auto">WiFi</a>'
-        except Exception:
-            pass
-    html += f'<a href="{url_for("logout")}" style="{_nb};margin-left:6px">Logout</a></nav>'
+    html += f'<a href="{url_for("logout")}" style="margin-left:8px;font-size:12px">Logout</a></nav>'
     return html
 
 
@@ -327,9 +288,9 @@ def render_page(content: str, active: str = "", title: str = "") -> str:
     # Global JS injected on every authenticated page.
     global_js = """<script>
 var PNA = (function(){
-  // Read saved values BEFORE any timer starts (TASK 7)
+  // Read saved refresh interval and subnet from localStorage.
   var _ms     = parseInt(localStorage.getItem('pna_refresh') || '5000');
-  // TASK 1: empty string means "All" — never fall back to auto-detect in JS
+  // Empty string means show all subnets.
   var _subnet = localStorage.getItem('pna_subnet');
   if(_subnet === null) _subnet = '';   // first visit: default to All
   var _timer  = null;
@@ -396,9 +357,9 @@ var PNA = (function(){
     }).catch(function(){});
   }
 
-  // timeAgo — identical wording on every page (TASK 7)
+  // Convert a UTC timestamp string to a human-readable "X min ago" label.
   function timeAgo(ts){
-    if(!ts) return '\u2014';
+    if(!ts) return '—';
     var d = new Date(ts.replace(' ','T')+'Z');
     var s = Math.floor((Date.now() - d) / 1000);
     if(isNaN(s) || s < 0) return ts;
@@ -441,7 +402,7 @@ var PNA = (function(){
     return 'Unknown Device';
   }
 
-  // TASK 7: always shows "Updated HH:MM:SS", called on EVERY poll cycle
+  // Show the current time in the nav bar after each data refresh.
   function markUpdated(){
     var el = document.getElementById('nav-last-updated');
     if(!el) return;
@@ -467,7 +428,7 @@ var PNA = (function(){
     if(_refreshFn) _timer = setInterval(_refreshFn, _ms);
   }
 
-  // Poll /api/status every 2s — uses subnet-scoped URL (TASK 1)
+  // Poll the status endpoint every 2 s to update the capture pill.
   function _pollStatus(){
     fetch(statusUrl()).then(function(r){ return r.json(); }).then(function(s){
       var running = !!s.capture_running;
@@ -592,7 +553,7 @@ def logout():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Overview  (TASK 2: all devices | TASK 3: AJAX | TASK 6: health banner)
+# Overview page
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -600,12 +561,11 @@ def logout():
 def index():
     db = Database()
 
-    # Read subnet filter first — all counts must reflect it (TASK 1)
+    # Apply the subnet filter from the URL query parameter.
     current_subnet = request.args.get("subnet", "").strip()
     if current_subnet == "all":
         current_subnet = ""
 
-    # All counts now scoped to selected subnet
     device_count     = db.device_count(subnet=current_subnet)
     anomaly_count    = db.anomaly_count(subnet=current_subnet)
     recent_anomalies = db.get_anomalies(limit=5)
@@ -616,11 +576,10 @@ def index():
     all_subnets = db.get_subnets()
     db.close()
 
-    # TASK 4: network info (gateway, broadcast, local IP) — lightweight, cached per request
+    # Gather local network info for the health banner.
     net_info = _get_network_info()
 
-    # TASK 1: subnet selector — always show "All" + list of known subnets.
-    # The server renders the initial state; the nav dropdown JS is the live control.
+    # Build the subnet dropdown for the page header.
     subnet_html = ""
     if all_subnets:
         opts_html = '<option value="">All</option>'
@@ -637,7 +596,7 @@ def index():
 
     cap_running = capture_is_running()
 
-    # TASK 3: Delete button is ALWAYS visible — JS handles both specific subnet and "All"
+    # Delete button works for a specific subnet or all data.
     delete_btn = (
         "<button id='delete-subnet-btn' class='btn btn-r' "
         "style='font-size:11px;padding:4px 10px;margin-left:8px' "
@@ -648,7 +607,6 @@ def index():
     h_cls       = {"Good": "c-green", "Warning": "c-yellow", "Critical": "c-red"}[health["status"]]
     ac_cls      = "c-red" if anomaly_count > 0 else "c-green"
 
-    # Device rows for initial render
     dev_rows = _device_rows_html(all_devices)
 
     # Anomaly rows
@@ -667,9 +625,8 @@ def index():
                     f"<th>Score</th><th>Reason</th><th>Detected</th></tr></thead>"
                     f"<tbody>{rows}</tbody></table></div>")
 
-    # TASK 1/2/3: page-local scripts
     ajax = """<script>
-// TASK 1: refresh device table and stat counters together using current subnet
+// Refresh device rows and stat counters for the currently selected subnet.
 function refreshDevices(){
   var url = PNA.devicesUrl();
   var statsUrl = PNA.statusUrl();
@@ -689,7 +646,7 @@ function refreshDevices(){
     var h = '';
     data.forEach(function(d){
       var dtype = PNA.deviceType(d.vendor, d.mac, d.packet_count);
-      h += '<tr><td>' + (d.ip||'\u2014') + '</td>'
+      h += '<tr><td>' + (d.ip||'—') + '</td>'
          + '<td class="mac">' + d.mac + '</td>'
          + '<td><span class="badge badge-type">' + dtype + '</span></td>'
          + '<td class="muted">' + PNA.timeAgo(d.last_seen) + '</td></tr>';
@@ -700,11 +657,17 @@ function refreshDevices(){
 }
 
 // Delete subnet — works for specific subnet AND "All" (empty string)
-window.deleteSubnet = function(){
-  var urlSubnet = new URLSearchParams(window.location.search).get('subnet') || '';
-  var isAll = (!urlSubnet || urlSubnet.toLowerCase() === 'all');
-  var payload = isAll ? 'All' : urlSubnet;
-  if(!confirm('Confirm delete?')) return;
+function deleteSubnet(){
+  var subnet = PNA.getSubnet();
+  // Empty string or "all" = delete everything
+  var isAll = (!subnet || subnet === 'all' || subnet === 'All');
+  var payload = isAll ? 'All' : subnet;
+  var msg = isAll
+    ? 'Are you sure you want to DELETE ALL data from every subnet?\n\nThis cannot be undone.'
+    : 'Delete data for subnet ' + subnet + '?\n\nThis cannot be undone.';
+
+  if(!confirm(msg)) return;
+
   fetch('/api/delete_subnet', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -712,15 +675,11 @@ window.deleteSubnet = function(){
   })
   .then(function(r){ return r.json(); })
   .then(function(d){
-    if(d.status !== 'ok'){ alert('Delete failed'); return; }
+    if(d.status === 'error'){ alert('Error: ' + (d.message || 'unknown')); return; }
     location.reload();
   })
-  .catch(function(err){
-    console.error(err);
-    alert('Request failed');
-  });
-};
-console.log("deleteSubnet LOADED OK");
+  .catch(function(){ alert('Request failed — please try again.'); });
+}
 
 document.addEventListener('DOMContentLoaded', function(){
   PNA.register(refreshDevices);
@@ -758,7 +717,7 @@ document.addEventListener('DOMContentLoaded', function(){
     </span>
   </div>
 
-  <!-- Stats — id="anom-count" lets AJAX update the anomaly counter (TASK 1) -->
+  <!-- Stats — AJAX updates device and anomaly counts on each poll -->
   <div class="stat-grid">
     <div class="stat"><div class="stat-label">Devices Seen</div>
       <div class="stat-value c-blue" id="dev-count">{device_count}</div></div>
@@ -833,9 +792,9 @@ def _device_type_label(vendor: str, mac: str = "", packet_count: int = 0) -> str
 
 def _time_ago_server(ts: str) -> str:
     """
-    TASK 3: Server-side version of timeAgo for the initial HTML render.
-    Produces identical wording to PNA.timeAgo() in JS:
-    'X sec ago' / 'X min ago' / 'X hr ago' / 'X day ago'.
+    Convert a UTC timestamp string to a human-readable relative label
+    for the initial server-rendered HTML.  Matches the wording produced
+    by PNA.timeAgo() in JavaScript so there is no flicker on load.
     """
     if not ts:
         return "—"
@@ -870,20 +829,19 @@ def _device_rows_html(devices: list) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Devices page (TASK 2: unlimited | TASK 3: AJAX refresh)
+# Device list page
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/devices")
 @login_required
 def devices():
     db = Database()
-    # AJAX will request the right subnet via PNA.devicesUrl()
     all_devices = db.get_all_devices()
     db.close()
 
     rows = ""
     for d in all_devices:
-        dtype = _device_type_label(d.get('vendor') or '', d.get('mac',''))  # TASK 5
+        dtype = _device_type_label(d.get('vendor') or '', d.get('mac',''))
         rows += (f"<tr><td>{d.get('ip') or '—'}</td>"
                  f"<td class='mac'>{d['mac']}</td>"
                  f"<td><span class='badge badge-type'>{dtype}</span></td>"
@@ -892,14 +850,14 @@ def devices():
 
     ajax = """<script>
 function refreshDevices(){
-  fetch(PNA.devicesUrl())          // TASK 3: includes ?subnet= from nav selector
+  fetch(PNA.devicesUrl())
     .then(function(r){ return r.json(); })
     .then(function(data){
       var tb = document.getElementById('dtbl'); if(!tb) return;
       var h = '';
       data.forEach(function(d){
         var dtype = PNA.deviceType(d.vendor, d.mac, d.packet_count);
-        h += '<tr><td>' + (d.ip||'\u2014') + '</td>'
+        h += '<tr><td>' + (d.ip||'—') + '</td>'
            + '<td class="mac">' + d.mac + '</td>'
            + '<td><span class="badge badge-type">' + dtype + '</span></td>'
            + '<td class="muted">' + PNA.timeAgo(d.first_seen) + '</td>'
@@ -922,7 +880,6 @@ document.addEventListener('DOMContentLoaded', function(){
              f"<tbody id='dtbl'>{rows}</tbody></table></div>"
              if all_devices else no_dev)
 
-    # Refresh interval is now in the global nav bar (TASK 3)
     content = f"""
 <div class="container">
   <h1 style="display:flex;align-items:center">
@@ -935,218 +892,63 @@ document.addEventListener('DOMContentLoaded', function(){
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Anomalies (TASK 4: shows reason column)
+# Anomaly detection page
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/anomalies", methods=["GET", "POST"])
 @login_required
 def anomalies():
-    """
-    Three-tab anomaly page:
-      Tab 1 — Current Anomalies: deduplicated by (mac, rule-type) so each
-               device+rule appears only once even if multiple runs fired it.
-      Tab 2 — Suspicious: one row per MAC, highest score wins, count shown.
-      Tab 3 — AI History: one row per MAC from ai_history, with status and
-               resolved_reason filled by the AI engine after each run.
-    """
-    db     = Database()
+    db = Database()
     subnet = request.args.get("subnet", "").strip() or None
-
     if request.method == "POST":
         res = run_full_analysis()
         flash(f"Analysis complete — {len(res['anomalies'])} anomalie(s) detected.", "success")
 
-    all_anom   = db.get_anomalies(limit=500, subnet=subnet)
-    ai_history = db.get_anomaly_history(limit=300, subnet=subnet)
+    all_anom = db.get_anomalies(limit=200, subnet=subnet)
     db.close()
 
-    SEV_CLS = {"Critical": "sev-critical", "High": "sev-high",
-               "Medium":   "sev-medium",   "Low":  "sev-low"}
-
-    # ── Tab 1: deduplicate by (mac, rule-type prefix) ─────────────────────
-    # Keep only the latest row per unique device+rule combination.
-    # This prevents the same "IP conflict" message appearing 20 times for
-    # the same MAC when multiple analysis runs fired within the window.
-    dedup_anom: dict = {}
+    rows = ""
     for a in all_anom:
-        # The rule prefix is everything before the first " – " or ":"
-        raw_reason = a.get("reason") or ""
-        prefix = raw_reason.split(" – ")[0].split(":")[0].strip()
-        key = (a["mac"], prefix)
-        # all_anom is already ordered newest-first; first hit wins
-        if key not in dedup_anom:
-            dedup_anom[key] = a
-    deduped = list(dedup_anom.values())
-
-    anom_rows = ""
-    for a in deduped:
+        reason = a.get("reason") or "—"
+        # Map severity string to the corresponding CSS badge class.
         sev     = a.get("severity") or "Low"
-        sev_cls = SEV_CLS.get(sev, "sev-low")
-        anom_rows += (
-            f"<tr><td class='mac'>{a['mac']}</td>"
-            f"<td>{a.get('ip') or '—'}</td>"
-            f"<td class='muted'>{a.get('vendor') or '—'}</td>"
-            f"<td class='c-red'>{a.get('score','')}</td>"
-            f"<td><span class='badge {sev_cls}'>{sev}</span></td>"
-            f"<td style='font-size:11px;max-width:240px'>{a.get('reason') or '—'}</td>"
-            f"<td class='muted'>{a.get('created_at','')}</td></tr>"
-        )
-    anom_empty = '<p class="muted">No anomalies detected. Run analysis to start.</p>'
-    anom_table = (
-        f"<table><thead><tr><th>MAC</th><th>IP</th><th>Vendor</th>"
-        f"<th>Score</th><th>Severity</th><th>Reason</th><th>Detected</th>"
-        f"</tr></thead><tbody>{anom_rows}</tbody></table>"
-        if deduped else anom_empty
-    )
+        sev_cls = {"Critical": "sev-critical", "High": "sev-high",
+                   "Medium": "sev-medium",   "Low":  "sev-low"}.get(sev, "sev-low")
+        rows += (f"<tr><td class='mac'>{a['mac']}</td>"
+                 f"<td>{a.get('ip') or '—'}</td>"
+                 f"<td class='muted'>{a.get('vendor') or '—'}</td>"
+                 f"<td class='c-red'>{a.get('score','')}</td>"
+                 f"<td><span class='badge {sev_cls}'>{sev}</span></td>"
+                 f"<td style='font-size:11px;max-width:260px'>{reason}</td>"
+                 f"<td class='muted'>{a.get('created_at','')}</td></tr>")
 
-    # ── Tab 2: one row per MAC, count of detections, highest score ────────
-    susp_map: dict = {}
-    for a in all_anom:
-        mac = a["mac"]
-        if mac not in susp_map:
-            susp_map[mac] = dict(a)
-            susp_map[mac]["count"] = 1
-        else:
-            susp_map[mac]["count"] += 1
-            if (a.get("score") or 0) > (susp_map[mac].get("score") or 0):
-                susp_map[mac].update(a)
-                susp_map[mac]["count"] = susp_map[mac]["count"]  # keep count
-    susp = sorted(susp_map.values(), key=lambda x: x.get("score") or 0, reverse=True)
-
-    susp_rows = ""
-    for d in susp:
-        sev     = d.get("severity") or "Low"
-        sev_cls = SEV_CLS.get(sev, "sev-low")
-        susp_rows += (
-            f"<tr><td class='mac'>{d['mac']}</td>"
-            f"<td>{d.get('ip') or '—'}</td>"
-            f"<td class='muted'>{d.get('vendor') or '—'}</td>"
-            f"<td><span class='badge {sev_cls}'>{sev}</span></td>"
-            f"<td class='c-red'>{d.get('score','')}</td>"
-            f"<td style='font-size:11px;max-width:200px'>{d.get('reason','') or '—'}</td>"
-            f"<td style='text-align:center'>{d.get('count',1)}</td>"
-            f"<td class='muted'>{d.get('created_at','')}</td></tr>"
-        )
-    susp_empty = '<p class="muted">No suspicious devices.</p>'
-    susp_table = (
-        f"<table><thead><tr><th>MAC</th><th>IP</th><th>Vendor</th>"
-        f"<th>Severity</th><th>Score</th><th>Latest Reason</th>"
-        f"<th>Detections</th><th>Last Flagged</th>"
-        f"</tr></thead><tbody>{susp_rows}</tbody></table>"
-        if susp else susp_empty
-    )
-
-    # ── Tab 3: AI History — one row per MAC, status + resolved reason ─────
-    hist_rows = ""
-    for h in ai_history:
-        sev     = h.get("severity") or "Low"
-        sev_cls = SEV_CLS.get(sev, "sev-low")
-        status  = h.get("status") or "active"
-        status_badge = (
-            '<span class="badge badge-ok">Resolved</span>'
-            if status == "resolved" else
-            '<span class="badge sev-high">Active</span>'
-        )
-        resolved_note = h.get("resolved_reason") or ""
-        if not resolved_note and h.get("resolved_at"):
-            resolved_note = "Marked resolved"
-        device_display = h.get("device_type") or h.get("vendor") or "—"
-        hist_rows += (
-            f"<tr><td class='mac'>{h.get('mac','')}</td>"
-            f"<td>{h.get('ip') or '—'}</td>"
-            f"<td class='muted'>{device_display}</td>"
-            f"<td>{status_badge}</td>"
-            f"<td><span class='badge {sev_cls}'>{sev}</span></td>"
-            f"<td style='font-size:11px;max-width:200px'>{h.get('reason','') or '—'}</td>"
-            f"<td style='font-size:11px;max-width:180px;color:var(--green)'>{resolved_note or '—'}</td>"
-            f"<td class='muted'>{h.get('first_detected','')}</td>"
-            f"<td class='muted'>{h.get('last_updated','')}</td></tr>"
-        )
-    hist_empty = (
-        '<p class="muted">No AI history yet. Run an analysis to populate.<br>'
-        '<small>History is stored in <code>ai_history</code> &mdash; '
-        'one row per MAC, updated in-place (no duplicates).</small></p>'
-    )
-    hist_table = (
-        f"<table><thead><tr><th>MAC</th><th>IP</th><th>Device</th>"
-        f"<th>Status</th><th>Severity</th><th>Reason</th>"
-        f"<th>Resolved Because</th><th>First Detected</th><th>Last Updated</th>"
-        f"</tr></thead><tbody>{hist_rows}</tbody></table>"
-        if ai_history else hist_empty
-    )
-
-    _btn = ("padding:8px 16px;font-size:12px;cursor:pointer;"
-            "border:1px solid var(--border);border-radius:4px 4px 0 0;"
-            "font-family:var(--font);margin-right:2px;background:var(--bg);"
-            "color:var(--muted)")
-
-    # Tab JS is a plain string (not f-string) to avoid brace-escaping issues
-    tab_js = """
-<script>
-(function () {
-  var panes = ['tab-anom', 'tab-susp', 'tab-hist'];
-  var btns  = ['btn-anom', 'btn-susp', 'btn-hist'];
-
-  window.showAnomalyTab = function (id) {
-    panes.forEach(function (p, i) {
-      var show = (p === id);
-      document.getElementById(p).style.display = show ? 'block' : 'none';
-      var b = document.getElementById(btns[i]);
-      if (b) {
-        b.style.background  = show ? 'var(--surface)' : 'var(--bg)';
-        b.style.color       = show ? 'var(--text)'    : 'var(--muted)';
-      }
-    });
-  };
-
-  showAnomalyTab('tab-anom');
-})();
-</script>"""
+    no_data = '<p class="muted">No anomalies recorded. Run analysis to start.</p>'
+    table = (f"<table><thead><tr><th>MAC</th><th>IP</th><th>Vendor</th>"
+             f"<th>Score</th><th>Severity</th><th>Reason</th><th>Detected</th></tr></thead>"
+             f"<tbody>{rows}</tbody></table>"
+             if all_anom else no_data)
 
     content = f"""
 <div class="container">
   <h1>Anomaly Detection</h1>
-  <div class="card" style="display:flex;align-items:center;gap:16px;margin-bottom:12px">
+  <div class="card" style="display:flex;align-items:center;gap:16px">
     <div style="flex:1"><strong>Run AI Analysis</strong><br>
-      <span class="muted">Rule engine (ARP flood &middot; IP conflict &middot; new device
-      &middot; traffic spike) + Isolation Forest.</span></div>
+      <span class="muted">Rule engine (ARP flood · IP conflict · new device · traffic spike)
+      + Isolation Forest.</span></div>
     <form method="POST">
-      <button class="btn btn-g" type="submit">&#9654; RUN ANALYSIS</button>
+      <button class="btn btn-g" type="submit">▶ RUN ANALYSIS</button>
     </form>
   </div>
-
-  <div style="margin-bottom:-1px">
-    <button id="btn-anom" onclick="showAnomalyTab('tab-anom')" style="{_btn}">
-      Current Anomalies ({len(deduped)})</button>
-    <button id="btn-susp" onclick="showAnomalyTab('tab-susp')" style="{_btn}">
-      Suspicious ({len(susp)})</button>
-    <button id="btn-hist" onclick="showAnomalyTab('tab-hist')" style="{_btn}">
-      AI History ({len(ai_history)})</button>
+  <div class="card">
+    <h2>Anomaly Log ({len(all_anom)})</h2>
+    {table}
   </div>
-
-  <div id="tab-anom" class="card" style="border-radius:0 4px 4px 4px">
-    <h2>Current Anomalies &mdash; one row per device+rule</h2>
-    {anom_table}
-  </div>
-  <div id="tab-susp" class="card" style="border-radius:0 4px 4px 4px;display:none">
-    <h2>Suspicious Devices &mdash; highest score per MAC</h2>
-    {susp_table}
-  </div>
-  <div id="tab-hist" class="card" style="border-radius:0 4px 4px 4px;display:none">
-    <h2>AI History &mdash; one lifecycle row per MAC</h2>
-    <p class="muted" style="font-size:11px;margin-bottom:8px">
-      Updated in-place after each analysis run. Resolved rows show why the
-      anomaly cleared. Data source: <code>ai_history</code> table.
-    </p>
-    {hist_table}
-  </div>
-</div>""" + tab_js
-
+</div>"""
     return render_page(content, active="anomalies", title="Anomalies")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TASK 6 Feature 1: Top Active Devices
+# Top active devices page
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/top-devices")
@@ -1179,7 +981,7 @@ def top_devices():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TASK 6 Feature 2: Suspicious Devices
+# Suspicious devices page
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/suspicious")
@@ -1230,7 +1032,7 @@ def suspicious():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TASK 6 Feature 4: Device Type Classification
+# Device type classification page
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/device-types")
@@ -1449,7 +1251,7 @@ function toggleCapture(){
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TASK 6 Feature 5: Export JSON report
+# JSON report export
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/export")
@@ -1482,7 +1284,7 @@ def export_report():
 def api_devices():
     db = Database()
     subnet = request.args.get("subnet", "all").strip()
-    # TASK 1: "all" or missing → return everything; any specific subnet → filter
+    # "all" or missing subnet returns all devices; any other value filters by subnet.
     if subnet and subnet != "all":
         data = db.get_all_devices(subnet=subnet)
     else:
@@ -1498,7 +1300,6 @@ def api_subnets():
     db = Database()
     subnets = db.get_subnets()
     db.close()
-    # TASK 1: return subnets only, no "current" — JS should not auto-pick
     return jsonify({"subnets": subnets})
 
 
@@ -1570,7 +1371,7 @@ def api_capture_stop():
 @login_required
 def api_status():
     db = Database()
-    # TASK 1: scope counts to the same subnet the UI is viewing
+    # Scope device and anomaly counts to the subnet currently viewed in the UI.
     subnet     = request.args.get("subnet", "").strip()
     if subnet == "all":
         subnet = ""
@@ -1585,228 +1386,6 @@ def api_status():
     }
     db.close()
     return jsonify(data)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
-# WiFi provisioning routes — login-free, work in hotspot mode
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-@app.route("/wifi-setup")
-def wifi_setup():
-    """WiFi network-selection page. Login-free — reachable from hotspot mode."""
-    content = """
-<div class="login-wrap">
-  <div class="login-box" style="width:420px">
-    <div class="login-logo">PINETAID</div>
-    <div class="login-sub">WiFi Setup</div>
-    <p class="muted" style="font-size:11px;text-align:center;margin-bottom:20px">
-      Select your network and enter the password.<br>
-      After connecting use the new IP, not 192.168.4.1.
-    </p>
-    <div id="wifi-msg" style="display:none;margin-bottom:14px;padding:9px 12px;
-         border-radius:4px;font-size:12px"></div>
-    <div class="form-group">
-      <label style="display:flex;justify-content:space-between;align-items:center">
-        WiFi Network
-        <button id="scan-btn" onclick="doScan()" type="button"
-                style="font-size:11px;padding:3px 10px;border:1px solid var(--border);
-                background:var(--surface);color:var(--muted);border-radius:4px;
-                cursor:pointer;font-family:var(--font)">&#8635; Scan</button>
-      </label>
-      <select id="ssid-sel"
-              style="width:100%;margin-top:6px;padding:8px 10px;background:var(--bg);
-                     color:var(--text);border:1px solid var(--border);border-radius:4px;
-                     font-family:var(--font);font-size:13px">
-        <option value="">Scanning...</option>
-      </select>
-      <input id="ssid-manual" type="text" placeholder="Type SSID here"
-             style="margin-top:8px;display:none" autocomplete="off">
-      <div style="margin-top:5px;font-size:11px;color:var(--muted)">
-        If your network does not appear,
-        <button onclick="showManual()" type="button"
-                style="background:none;border:none;color:var(--blue);font-size:11px;
-                cursor:pointer;font-family:var(--font);padding:0;text-decoration:underline">
-          enter the SSID manually</button>.
-      </div>
-    </div>
-    <div class="form-group">
-      <label>Password</label>
-      <div style="position:relative">
-        <input id="wifi-pwd" type="password" placeholder="WiFi password" autocomplete="off">
-        <button type="button" onclick="togglePwd()"
-                style="position:absolute;right:10px;top:50%;transform:translateY(-50%);
-                background:none;border:none;color:var(--muted);cursor:pointer;
-                font-size:11px;font-family:var(--font)">SHOW</button>
-      </div>
-    </div>
-    <button id="conn-btn" onclick="doConnect()" type="button"
-            class="btn btn-g" style="width:100%">CONNECT</button>
-    <div style="margin-top:10px;text-align:center">
-      <button onclick="doStartHotspot()" type="button"
-              style="background:none;border:1px solid var(--border);color:var(--muted);
-              font-size:11px;padding:4px 12px;border-radius:4px;cursor:pointer;
-              font-family:var(--font)">Start Setup Hotspot</button>
-    </div>
-    <div style="margin-top:8px;text-align:center">
-      <a href="/" style="color:var(--muted);font-size:11px">Back to dashboard</a>
-    </div>
-  </div>
-</div>"""
-
-    content += """
-<script>
-(function () {
-  'use strict';
-  var _scanBusy = false, _connectBusy = false;
-
-  function doScan() {
-    if (_scanBusy) return;
-    _scanBusy = true;
-    var btn = document.getElementById('scan-btn');
-    var sel = document.getElementById('ssid-sel');
-    btn.textContent = '...'; btn.disabled = true;
-    sel.innerHTML   = '<option value="">Scanning...</option>';
-    fetch('/api/wifi/scan')
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        btn.textContent = '\u21bb Scan'; btn.disabled = false; _scanBusy = false;
-        var nets = d.networks || [];
-        if (nets.length) {
-          sel.innerHTML = '<option value="">-- select network --</option>';
-          nets.forEach(function (s) {
-            var o = document.createElement('option');
-            o.value = s; o.textContent = s; sel.appendChild(o);
-          });
-        } else {
-          sel.innerHTML = '<option value="">No networks found</option>';
-          showManual();
-          showMsg('No networks found. Enter the SSID manually.', 'warn');
-        }
-      })
-      .catch(function () {
-        btn.textContent = '\u21bb Scan'; btn.disabled = false; _scanBusy = false;
-        sel.innerHTML = '<option value="">Scan failed</option>';
-        showManual();
-        showMsg('Scan failed. Enter the SSID manually.', 'warn');
-      });
-  }
-
-  window.showManual = function () {
-    document.getElementById('ssid-manual').style.display = 'block';
-  };
-  window.togglePwd = function () {
-    var i = document.getElementById('wifi-pwd');
-    i.type = (i.type === 'password') ? 'text' : 'password';
-  };
-  window.doConnect = function () {
-    if (_connectBusy) return;
-    var manual = document.getElementById('ssid-manual');
-    var sel    = document.getElementById('ssid-sel');
-    var ssid   = (manual.style.display !== 'none' && manual.value.trim())
-                  ? manual.value.trim() : sel.value.trim();
-    var pwd    = document.getElementById('wifi-pwd').value;
-    var btn    = document.getElementById('conn-btn');
-    if (!ssid) { showMsg('Please select or enter an SSID.', 'error'); return; }
-    _connectBusy = true; btn.disabled = true; btn.textContent = 'CONNECTING...';
-    showMsg('Connecting to \u201c' + ssid + '\u201d\u2026 (~25 s)', 'info');
-    fetch('/api/wifi/connect', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ssid: ssid, password: pwd})
-    })
-    .then(function (r) { return r.json(); })
-    .then(function (d) {
-      _connectBusy = false; btn.disabled = false; btn.textContent = 'CONNECT';
-      showMsg(d.message || (d.success ? 'Connected.' : 'Failed.'),
-              d.success ? 'ok' : 'error');
-    })
-    .catch(function () {
-      _connectBusy = false; btn.disabled = false; btn.textContent = 'CONNECT';
-      showMsg('Pi may have switched networks. Reconnect and open its new IP.', 'warn');
-    });
-  };
-  window.doStartHotspot = function () {
-    showMsg('Starting setup hotspot...', 'info');
-    fetch('/api/wifi/start-hotspot', {method: 'POST'})
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        showMsg(d.message || (d.success ? 'Hotspot started.' : 'Failed.'),
-                d.success ? 'ok' : 'error');
-      })
-      .catch(function () { showMsg('Could not reach server.', 'error'); });
-  };
-  function showMsg(text, type) {
-    var p = {
-      ok:   {bg:'#1a2e1a',border:'#4caf50',   color:'#4caf50'},
-      error:{bg:'#3d1f1f',border:'var(--red)', color:'var(--red)'},
-      warn: {bg:'#2d2000',border:'var(--yellow)',color:'var(--yellow)'},
-      info: {bg:'#1a2a3d',border:'var(--blue)', color:'var(--blue)'},
-    };
-    var c = p[type] || p.info;
-    var el = document.getElementById('wifi-msg');
-    el.style.cssText = 'display:block;background:' + c.bg
-                     + ';border:1px solid ' + c.border + ';color:' + c.color;
-    el.textContent = text;
-  }
-  doScan();
-})();
-</script>"""
-    return render_page(content, title="WiFi Setup")
-
-
-@app.route("/api/wifi/scan")
-def api_wifi_scan():
-    """Return visible SSIDs. No login required."""
-    if not _WIFI_AVAILABLE:
-        return jsonify({"networks": [], "error": "wifi_provision not installed"}), 503
-    try:
-        return jsonify({"networks": scan_networks()})
-    except Exception as exc:
-        logger.error("/api/wifi/scan: %s", exc)
-        return jsonify({"networks": [], "error": str(exc)}), 500
-
-
-@app.route("/api/wifi/connect", methods=["POST"])
-def api_wifi_connect():
-    """Write credentials and attempt a WiFi connection. No login required."""
-    if not _WIFI_AVAILABLE:
-        return jsonify({"success": False, "message": "wifi_provision not installed"}), 503
-    try:
-        data = request.get_json(silent=True) or {}
-        ssid = (data.get("ssid") or "").strip()
-        pwd  = data.get("password") or ""
-        if not ssid:
-            return jsonify({"success": False, "message": "SSID required"}), 400
-        return jsonify(result := connect_to_wifi(ssid, pwd)), (200 if result.get("success") else 500)
-    except Exception as exc:
-        logger.error("/api/wifi/connect: %s", exc)
-        return jsonify({"success": False, "message": f"Server error: {exc}"}), 500
-
-
-@app.route("/api/wifi/status")
-def api_wifi_status():
-    """Return current network mode and IPs. No login required."""
-    if not _WIFI_AVAILABLE:
-        return jsonify({"mode": "unknown"})
-    try:
-        return jsonify(get_wifi_status())
-    except Exception as exc:
-        return jsonify({"mode": "unknown", "error": str(exc)}), 500
-
-
-@app.route("/api/wifi/start-hotspot", methods=["POST"])
-def api_wifi_start_hotspot():
-    """Force the device into AP mode. No login required."""
-    if not _WIFI_AVAILABLE:
-        return jsonify({"success": False, "message": "wifi_provision not installed"}), 503
-    try:
-        enable_force_hotspot()
-        result = start_hotspot()
-        return jsonify(result), (200 if result.get("success") else 500)
-    except Exception as exc:
-        logger.error("/api/wifi/start-hotspot: %s", exc)
-        return jsonify({"success": False, "message": f"Server error: {exc}"}), 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────

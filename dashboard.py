@@ -31,6 +31,14 @@ from capture import (
     start_capture_thread, stop_capture_thread,
     capture_is_running, get_cached_devices,
 )
+try:
+    from wifi_provision import (
+        scan_networks, connect_to_wifi, get_wifi_status,
+        start_hotspot, enable_force_hotspot, HOTSPOT_IP,
+    )
+    _WIFI_AVAILABLE = True
+except ImportError:
+    _WIFI_AVAILABLE = False
 
 logger = logging.getLogger("pinetaid.dashboard")
 
@@ -242,7 +250,6 @@ def _nav(active: str) -> str:
         ("devices",      "devices",      "Devices"),
         ("anomalies",    "anomalies",    "Anomalies"),
         ("top",          "top_devices",  "Top Active"),
-        ("suspicious",   "suspicious",   "Suspicious"),
         ("device-types", "device_types", "Device Types"),
         ("diag",         "diag_page",    "Diagnostics"),
         ("capture",      "capture_page", "Capture"),
@@ -289,7 +296,14 @@ def _nav(active: str) -> str:
         '</div>'
     )
 
-    html += f'<a href="{url_for("logout")}" style="margin-left:8px;font-size:12px">Logout</a></nav>'
+    _nb = ('font-size:11px;padding:3px 8px;border:1px solid var(--border);'
+           'border-radius:3px;color:var(--muted);text-decoration:none')
+    if _WIFI_AVAILABLE:
+        try:
+            html += f'<a href="{url_for("wifi_setup")}" style="{_nb};margin-left:auto">WiFi</a>'
+        except Exception:
+            pass
+    html += f'<a href="{url_for("logout")}" style="{_nb};margin-left:6px">Logout</a></nav>'
     return html
 
 
@@ -927,150 +941,207 @@ document.addEventListener('DOMContentLoaded', function(){
 @app.route("/anomalies", methods=["GET", "POST"])
 @login_required
 def anomalies():
+    """
+    Three-tab anomaly page:
+      Tab 1 — Current Anomalies: deduplicated by (mac, rule-type) so each
+               device+rule appears only once even if multiple runs fired it.
+      Tab 2 — Suspicious: one row per MAC, highest score wins, count shown.
+      Tab 3 — AI History: one row per MAC from ai_history, with status and
+               resolved_reason filled by the AI engine after each run.
+    """
     db     = Database()
     subnet = request.args.get("subnet", "").strip() or None
+
     if request.method == "POST":
         res = run_full_analysis()
         flash(f"Analysis complete — {len(res['anomalies'])} anomalie(s) detected.", "success")
 
-    all_anom = db.get_anomalies(limit=200, subnet=subnet)
+    all_anom   = db.get_anomalies(limit=500, subnet=subnet)
+    ai_history = db.get_anomaly_history(limit=300, subnet=subnet)
     db.close()
 
     SEV_CLS = {"Critical": "sev-critical", "High": "sev-high",
                "Medium":   "sev-medium",   "Low":  "sev-low"}
 
-    rows = ""
+    # ── Tab 1: deduplicate by (mac, rule-type prefix) ─────────────────────
+    # Keep only the latest row per unique device+rule combination.
+    # This prevents the same "IP conflict" message appearing 20 times for
+    # the same MAC when multiple analysis runs fired within the window.
+    dedup_anom: dict = {}
     for a in all_anom:
-        reason  = a.get("reason") or "\u2014"
+        # The rule prefix is everything before the first " – " or ":"
+        raw_reason = a.get("reason") or ""
+        prefix = raw_reason.split(" – ")[0].split(":")[0].strip()
+        key = (a["mac"], prefix)
+        # all_anom is already ordered newest-first; first hit wins
+        if key not in dedup_anom:
+            dedup_anom[key] = a
+    deduped = list(dedup_anom.values())
+
+    anom_rows = ""
+    for a in deduped:
         sev     = a.get("severity") or "Low"
         sev_cls = SEV_CLS.get(sev, "sev-low")
-        rows += (f"<tr><td class='mac'>{a['mac']}</td>"
-                 f"<td>{a.get('ip') or '\u2014'}</td>"
-                 f"<td class='muted'>{a.get('vendor') or '\u2014'}</td>"
-                 f"<td class='c-red'>{a.get('score','')}</td>"
-                 f"<td><span class='badge {sev_cls}'>{sev}</span></td>"
-                 f"<td style='font-size:11px;max-width:260px'>{reason}</td>"
-                 f"<td class='muted'>{a.get('created_at','')}</td></tr>")
+        anom_rows += (
+            f"<tr><td class='mac'>{a['mac']}</td>"
+            f"<td>{a.get('ip') or '—'}</td>"
+            f"<td class='muted'>{a.get('vendor') or '—'}</td>"
+            f"<td class='c-red'>{a.get('score','')}</td>"
+            f"<td><span class='badge {sev_cls}'>{sev}</span></td>"
+            f"<td style='font-size:11px;max-width:240px'>{a.get('reason') or '—'}</td>"
+            f"<td class='muted'>{a.get('created_at','')}</td></tr>"
+        )
+    anom_empty = '<p class="muted">No anomalies detected. Run analysis to start.</p>'
+    anom_table = (
+        f"<table><thead><tr><th>MAC</th><th>IP</th><th>Vendor</th>"
+        f"<th>Score</th><th>Severity</th><th>Reason</th><th>Detected</th>"
+        f"</tr></thead><tbody>{anom_rows}</tbody></table>"
+        if deduped else anom_empty
+    )
 
-    no_data      = '<p class="muted">No anomalies recorded. Run analysis to start.</p>'
-    active_table = (f"<table><thead><tr><th>MAC</th><th>IP</th><th>Vendor</th>"
-                    f"<th>Score</th><th>Severity</th><th>Reason</th><th>Detected</th>"
-                    f"</tr></thead><tbody>{rows}</tbody></table>"
-                    if all_anom else no_data)
+    # ── Tab 2: one row per MAC, count of detections, highest score ────────
+    susp_map: dict = {}
+    for a in all_anom:
+        mac = a["mac"]
+        if mac not in susp_map:
+            susp_map[mac] = dict(a)
+            susp_map[mac]["count"] = 1
+        else:
+            susp_map[mac]["count"] += 1
+            if (a.get("score") or 0) > (susp_map[mac].get("score") or 0):
+                susp_map[mac].update(a)
+                susp_map[mac]["count"] = susp_map[mac]["count"]  # keep count
+    susp = sorted(susp_map.values(), key=lambda x: x.get("score") or 0, reverse=True)
+
+    susp_rows = ""
+    for d in susp:
+        sev     = d.get("severity") or "Low"
+        sev_cls = SEV_CLS.get(sev, "sev-low")
+        susp_rows += (
+            f"<tr><td class='mac'>{d['mac']}</td>"
+            f"<td>{d.get('ip') or '—'}</td>"
+            f"<td class='muted'>{d.get('vendor') or '—'}</td>"
+            f"<td><span class='badge {sev_cls}'>{sev}</span></td>"
+            f"<td class='c-red'>{d.get('score','')}</td>"
+            f"<td style='font-size:11px;max-width:200px'>{d.get('reason','') or '—'}</td>"
+            f"<td style='text-align:center'>{d.get('count',1)}</td>"
+            f"<td class='muted'>{d.get('created_at','')}</td></tr>"
+        )
+    susp_empty = '<p class="muted">No suspicious devices.</p>'
+    susp_table = (
+        f"<table><thead><tr><th>MAC</th><th>IP</th><th>Vendor</th>"
+        f"<th>Severity</th><th>Score</th><th>Latest Reason</th>"
+        f"<th>Detections</th><th>Last Flagged</th>"
+        f"</tr></thead><tbody>{susp_rows}</tbody></table>"
+        if susp else susp_empty
+    )
+
+    # ── Tab 3: AI History — one row per MAC, status + resolved reason ─────
+    hist_rows = ""
+    for h in ai_history:
+        sev     = h.get("severity") or "Low"
+        sev_cls = SEV_CLS.get(sev, "sev-low")
+        status  = h.get("status") or "active"
+        status_badge = (
+            '<span class="badge badge-ok">Resolved</span>'
+            if status == "resolved" else
+            '<span class="badge sev-high">Active</span>'
+        )
+        resolved_note = h.get("resolved_reason") or ""
+        if not resolved_note and h.get("resolved_at"):
+            resolved_note = "Marked resolved"
+        device_display = h.get("device_type") or h.get("vendor") or "—"
+        hist_rows += (
+            f"<tr><td class='mac'>{h.get('mac','')}</td>"
+            f"<td>{h.get('ip') or '—'}</td>"
+            f"<td class='muted'>{device_display}</td>"
+            f"<td>{status_badge}</td>"
+            f"<td><span class='badge {sev_cls}'>{sev}</span></td>"
+            f"<td style='font-size:11px;max-width:200px'>{h.get('reason','') or '—'}</td>"
+            f"<td style='font-size:11px;max-width:180px;color:var(--green)'>{resolved_note or '—'}</td>"
+            f"<td class='muted'>{h.get('first_detected','')}</td>"
+            f"<td class='muted'>{h.get('last_updated','')}</td></tr>"
+        )
+    hist_empty = (
+        '<p class="muted">No AI history yet. Run an analysis to populate.<br>'
+        '<small>History is stored in <code>ai_history</code> &mdash; '
+        'one row per MAC, updated in-place (no duplicates).</small></p>'
+    )
+    hist_table = (
+        f"<table><thead><tr><th>MAC</th><th>IP</th><th>Device</th>"
+        f"<th>Status</th><th>Severity</th><th>Reason</th>"
+        f"<th>Resolved Because</th><th>First Detected</th><th>Last Updated</th>"
+        f"</tr></thead><tbody>{hist_rows}</tbody></table>"
+        if ai_history else hist_empty
+    )
+
+    _btn = ("padding:8px 16px;font-size:12px;cursor:pointer;"
+            "border:1px solid var(--border);border-radius:4px 4px 0 0;"
+            "font-family:var(--font);margin-right:2px;background:var(--bg);"
+            "color:var(--muted)")
+
+    # Tab JS is a plain string (not f-string) to avoid brace-escaping issues
+    tab_js = """
+<script>
+(function () {
+  var panes = ['tab-anom', 'tab-susp', 'tab-hist'];
+  var btns  = ['btn-anom', 'btn-susp', 'btn-hist'];
+
+  window.showAnomalyTab = function (id) {
+    panes.forEach(function (p, i) {
+      var show = (p === id);
+      document.getElementById(p).style.display = show ? 'block' : 'none';
+      var b = document.getElementById(btns[i]);
+      if (b) {
+        b.style.background  = show ? 'var(--surface)' : 'var(--bg)';
+        b.style.color       = show ? 'var(--text)'    : 'var(--muted)';
+      }
+    });
+  };
+
+  showAnomalyTab('tab-anom');
+})();
+</script>"""
 
     content = f"""
 <div class="container">
   <h1>Anomaly Detection</h1>
-  <div class="card" style="display:flex;align-items:center;gap:16px">
+  <div class="card" style="display:flex;align-items:center;gap:16px;margin-bottom:12px">
     <div style="flex:1"><strong>Run AI Analysis</strong><br>
-      <span class="muted">Rule engine (ARP flood \xb7 IP conflict \xb7 new device \xb7 traffic spike)
-      + Isolation Forest.</span></div>
+      <span class="muted">Rule engine (ARP flood &middot; IP conflict &middot; new device
+      &middot; traffic spike) + Isolation Forest.</span></div>
     <form method="POST">
-      <button class="btn btn-g" type="submit">\u25b6 RUN ANALYSIS</button>
+      <button class="btn btn-g" type="submit">&#9654; RUN ANALYSIS</button>
     </form>
   </div>
 
-  <div style="display:flex;gap:4px;margin-top:8px;margin-bottom:-1px">
-    <button id="btn-active"
-            onclick="window._showAnomalyTab('anomalies')"
-            style="padding:8px 18px;font-family:var(--font);font-size:12px;cursor:pointer;
-                   border:1px solid var(--border);border-bottom:none;font-weight:bold;
-                   border-radius:4px 4px 0 0;background:var(--surface);color:var(--text)">
-      Active ({len(all_anom)})
-    </button>
-    <button id="btn-history"
-            onclick="window._showAnomalyTab('history')"
-            style="padding:8px 18px;font-family:var(--font);font-size:12px;cursor:pointer;
-                   border:1px solid var(--border);border-bottom:none;font-weight:normal;
-                   border-radius:4px 4px 0 0;background:var(--bg);color:var(--muted)">
-      History
-    </button>
+  <div style="margin-bottom:-1px">
+    <button id="btn-anom" onclick="showAnomalyTab('tab-anom')" style="{_btn}">
+      Current Anomalies ({len(deduped)})</button>
+    <button id="btn-susp" onclick="showAnomalyTab('tab-susp')" style="{_btn}">
+      Suspicious ({len(susp)})</button>
+    <button id="btn-hist" onclick="showAnomalyTab('tab-hist')" style="{_btn}">
+      AI History ({len(ai_history)})</button>
   </div>
 
-  <div id="tab-anomalies" class="card" style="border-radius:0 4px 4px 4px;margin-top:0">
-    <h2>Active Anomalies ({len(all_anom)})</h2>
-    {active_table}
+  <div id="tab-anom" class="card" style="border-radius:0 4px 4px 4px">
+    <h2>Current Anomalies &mdash; one row per device+rule</h2>
+    {anom_table}
   </div>
-
-  <div id="tab-history" class="card"
-       style="display:none;border-radius:0 4px 4px 4px;margin-top:0">
-    <h2>Anomaly History</h2>
-    <div id="history-body"><p class="muted">Loading\u2026</p></div>
+  <div id="tab-susp" class="card" style="border-radius:0 4px 4px 4px;display:none">
+    <h2>Suspicious Devices &mdash; highest score per MAC</h2>
+    {susp_table}
   </div>
-</div>"""
+  <div id="tab-hist" class="card" style="border-radius:0 4px 4px 4px;display:none">
+    <h2>AI History &mdash; one lifecycle row per MAC</h2>
+    <p class="muted" style="font-size:11px;margin-bottom:8px">
+      Updated in-place after each analysis run. Resolved rows show why the
+      anomaly cleared. Data source: <code>ai_history</code> table.
+    </p>
+    {hist_table}
+  </div>
+</div>""" + tab_js
 
-    # Script is a plain string (not f-string) to avoid brace-escaping issues
-    content += """
-<script>
-(function () {
-  'use strict';
-  var _busy = false;
-
-  function _renderHistory(data) {
-    var el = document.getElementById('history-body');
-    if (!el) return;
-    if (!data || data.length === 0) {
-      el.innerHTML = '<p class="muted">No resolved anomalies yet.</p>';
-      return;
-    }
-    var sc = {Critical:'sev-critical',High:'sev-high',Medium:'sev-medium',Low:'sev-low'};
-    var rows = data.map(function (h) {
-      var sev = h.severity || 'Low';
-      // History tab shows only resolved rows — always display Resolved badge
-      var badge = '<span class="badge" style="background:#1a2e1a;color:#4caf50;'
-                + 'border:1px solid #4caf50">Resolved</span>';
-      return '<tr>'
-        + '<td class="mac">'   + (h.mac         || '\u2014') + '</td>'
-        + '<td>'               + (h.ip           || '\u2014') + '</td>'
-        + '<td class="muted">' + (h.device_type  || '\u2014') + '</td>'
-        + '<td><span class="badge ' + (sc[sev] || 'sev-low') + '">' + sev + '</span></td>'
-        + '<td>' + badge + '</td>'
-        + '<td class="muted" style="font-size:11px">' + (h.last_updated || '\u2014') + '</td>'
-        + '</tr>';
-    }).join('');
-    el.innerHTML = '<div class="tbl-wrap">'
-      + '<table><thead><tr><th>MAC</th><th>IP</th><th>Type</th>'
-      + '<th>Severity</th><th>Status</th><th>Resolved At</th>'
-      + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
-  }
-
-  function _loadHistory() {
-    if (_busy) return;
-    _busy = true;
-    fetch('/api/history' + (window.location.search || ''))
-      .then(function (r) { return r.json(); })
-      .then(function (d) { _renderHistory(d); })
-      .catch(function (err) {
-        var el = document.getElementById('history-body');
-        if (el) el.innerHTML = '<p class="muted">Could not load history.</p>';
-        console.error('history fetch error:', err);
-      })
-      .finally(function () { _busy = false; });
-  }
-
-  window._showAnomalyTab = function (tab) {
-    var pA = document.getElementById('tab-anomalies');
-    var pH = document.getElementById('tab-history');
-    var bA = document.getElementById('btn-active');
-    var bH = document.getElementById('btn-history');
-    if (!pA || !pH) return;
-
-    var isActive = (tab === 'anomalies');
-    pA.style.display    = isActive ? 'block' : 'none';
-    pH.style.display    = isActive ? 'none'  : 'block';
-    bA.style.background = isActive ? 'var(--surface)' : 'var(--bg)';
-    bA.style.color      = isActive ? 'var(--text)'    : 'var(--muted)';
-    bA.style.fontWeight = isActive ? 'bold'           : 'normal';
-    bH.style.background = isActive ? 'var(--bg)'      : 'var(--surface)';
-    bH.style.color      = isActive ? 'var(--muted)'   : 'var(--text)';
-    bH.style.fontWeight = isActive ? 'normal'         : 'bold';
-
-    if (!isActive) _loadHistory();
-  };
-
-  console.log('_showAnomalyTab ready');
-})();
-</script>"""
     return render_page(content, active="anomalies", title="Anomalies")
 
 
@@ -1441,20 +1512,6 @@ def api_anomalies():
     return jsonify(data)
 
 
-@app.route("/api/history")
-@login_required
-def api_history():
-    """
-    Returns only resolved anomaly history rows.
-    Active anomalies are served by /api/anomalies — never from here.
-    """
-    db     = Database()
-    subnet = request.args.get("subnet", "").strip() or None
-    rows   = db.get_anomaly_history(limit=200, subnet=subnet)
-    db.close()
-    return jsonify(rows)
-
-
 @app.route("/api/clear-subnet", methods=["POST"])
 @login_required
 def api_clear_subnet():
@@ -1528,6 +1585,228 @@ def api_status():
     }
     db.close()
     return jsonify(data)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# WiFi provisioning routes — login-free, work in hotspot mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@app.route("/wifi-setup")
+def wifi_setup():
+    """WiFi network-selection page. Login-free — reachable from hotspot mode."""
+    content = """
+<div class="login-wrap">
+  <div class="login-box" style="width:420px">
+    <div class="login-logo">PINETAID</div>
+    <div class="login-sub">WiFi Setup</div>
+    <p class="muted" style="font-size:11px;text-align:center;margin-bottom:20px">
+      Select your network and enter the password.<br>
+      After connecting use the new IP, not 192.168.4.1.
+    </p>
+    <div id="wifi-msg" style="display:none;margin-bottom:14px;padding:9px 12px;
+         border-radius:4px;font-size:12px"></div>
+    <div class="form-group">
+      <label style="display:flex;justify-content:space-between;align-items:center">
+        WiFi Network
+        <button id="scan-btn" onclick="doScan()" type="button"
+                style="font-size:11px;padding:3px 10px;border:1px solid var(--border);
+                background:var(--surface);color:var(--muted);border-radius:4px;
+                cursor:pointer;font-family:var(--font)">&#8635; Scan</button>
+      </label>
+      <select id="ssid-sel"
+              style="width:100%;margin-top:6px;padding:8px 10px;background:var(--bg);
+                     color:var(--text);border:1px solid var(--border);border-radius:4px;
+                     font-family:var(--font);font-size:13px">
+        <option value="">Scanning...</option>
+      </select>
+      <input id="ssid-manual" type="text" placeholder="Type SSID here"
+             style="margin-top:8px;display:none" autocomplete="off">
+      <div style="margin-top:5px;font-size:11px;color:var(--muted)">
+        If your network does not appear,
+        <button onclick="showManual()" type="button"
+                style="background:none;border:none;color:var(--blue);font-size:11px;
+                cursor:pointer;font-family:var(--font);padding:0;text-decoration:underline">
+          enter the SSID manually</button>.
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Password</label>
+      <div style="position:relative">
+        <input id="wifi-pwd" type="password" placeholder="WiFi password" autocomplete="off">
+        <button type="button" onclick="togglePwd()"
+                style="position:absolute;right:10px;top:50%;transform:translateY(-50%);
+                background:none;border:none;color:var(--muted);cursor:pointer;
+                font-size:11px;font-family:var(--font)">SHOW</button>
+      </div>
+    </div>
+    <button id="conn-btn" onclick="doConnect()" type="button"
+            class="btn btn-g" style="width:100%">CONNECT</button>
+    <div style="margin-top:10px;text-align:center">
+      <button onclick="doStartHotspot()" type="button"
+              style="background:none;border:1px solid var(--border);color:var(--muted);
+              font-size:11px;padding:4px 12px;border-radius:4px;cursor:pointer;
+              font-family:var(--font)">Start Setup Hotspot</button>
+    </div>
+    <div style="margin-top:8px;text-align:center">
+      <a href="/" style="color:var(--muted);font-size:11px">Back to dashboard</a>
+    </div>
+  </div>
+</div>"""
+
+    content += """
+<script>
+(function () {
+  'use strict';
+  var _scanBusy = false, _connectBusy = false;
+
+  function doScan() {
+    if (_scanBusy) return;
+    _scanBusy = true;
+    var btn = document.getElementById('scan-btn');
+    var sel = document.getElementById('ssid-sel');
+    btn.textContent = '...'; btn.disabled = true;
+    sel.innerHTML   = '<option value="">Scanning...</option>';
+    fetch('/api/wifi/scan')
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        btn.textContent = '\u21bb Scan'; btn.disabled = false; _scanBusy = false;
+        var nets = d.networks || [];
+        if (nets.length) {
+          sel.innerHTML = '<option value="">-- select network --</option>';
+          nets.forEach(function (s) {
+            var o = document.createElement('option');
+            o.value = s; o.textContent = s; sel.appendChild(o);
+          });
+        } else {
+          sel.innerHTML = '<option value="">No networks found</option>';
+          showManual();
+          showMsg('No networks found. Enter the SSID manually.', 'warn');
+        }
+      })
+      .catch(function () {
+        btn.textContent = '\u21bb Scan'; btn.disabled = false; _scanBusy = false;
+        sel.innerHTML = '<option value="">Scan failed</option>';
+        showManual();
+        showMsg('Scan failed. Enter the SSID manually.', 'warn');
+      });
+  }
+
+  window.showManual = function () {
+    document.getElementById('ssid-manual').style.display = 'block';
+  };
+  window.togglePwd = function () {
+    var i = document.getElementById('wifi-pwd');
+    i.type = (i.type === 'password') ? 'text' : 'password';
+  };
+  window.doConnect = function () {
+    if (_connectBusy) return;
+    var manual = document.getElementById('ssid-manual');
+    var sel    = document.getElementById('ssid-sel');
+    var ssid   = (manual.style.display !== 'none' && manual.value.trim())
+                  ? manual.value.trim() : sel.value.trim();
+    var pwd    = document.getElementById('wifi-pwd').value;
+    var btn    = document.getElementById('conn-btn');
+    if (!ssid) { showMsg('Please select or enter an SSID.', 'error'); return; }
+    _connectBusy = true; btn.disabled = true; btn.textContent = 'CONNECTING...';
+    showMsg('Connecting to \u201c' + ssid + '\u201d\u2026 (~25 s)', 'info');
+    fetch('/api/wifi/connect', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ssid: ssid, password: pwd})
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      _connectBusy = false; btn.disabled = false; btn.textContent = 'CONNECT';
+      showMsg(d.message || (d.success ? 'Connected.' : 'Failed.'),
+              d.success ? 'ok' : 'error');
+    })
+    .catch(function () {
+      _connectBusy = false; btn.disabled = false; btn.textContent = 'CONNECT';
+      showMsg('Pi may have switched networks. Reconnect and open its new IP.', 'warn');
+    });
+  };
+  window.doStartHotspot = function () {
+    showMsg('Starting setup hotspot...', 'info');
+    fetch('/api/wifi/start-hotspot', {method: 'POST'})
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        showMsg(d.message || (d.success ? 'Hotspot started.' : 'Failed.'),
+                d.success ? 'ok' : 'error');
+      })
+      .catch(function () { showMsg('Could not reach server.', 'error'); });
+  };
+  function showMsg(text, type) {
+    var p = {
+      ok:   {bg:'#1a2e1a',border:'#4caf50',   color:'#4caf50'},
+      error:{bg:'#3d1f1f',border:'var(--red)', color:'var(--red)'},
+      warn: {bg:'#2d2000',border:'var(--yellow)',color:'var(--yellow)'},
+      info: {bg:'#1a2a3d',border:'var(--blue)', color:'var(--blue)'},
+    };
+    var c = p[type] || p.info;
+    var el = document.getElementById('wifi-msg');
+    el.style.cssText = 'display:block;background:' + c.bg
+                     + ';border:1px solid ' + c.border + ';color:' + c.color;
+    el.textContent = text;
+  }
+  doScan();
+})();
+</script>"""
+    return render_page(content, title="WiFi Setup")
+
+
+@app.route("/api/wifi/scan")
+def api_wifi_scan():
+    """Return visible SSIDs. No login required."""
+    if not _WIFI_AVAILABLE:
+        return jsonify({"networks": [], "error": "wifi_provision not installed"}), 503
+    try:
+        return jsonify({"networks": scan_networks()})
+    except Exception as exc:
+        logger.error("/api/wifi/scan: %s", exc)
+        return jsonify({"networks": [], "error": str(exc)}), 500
+
+
+@app.route("/api/wifi/connect", methods=["POST"])
+def api_wifi_connect():
+    """Write credentials and attempt a WiFi connection. No login required."""
+    if not _WIFI_AVAILABLE:
+        return jsonify({"success": False, "message": "wifi_provision not installed"}), 503
+    try:
+        data = request.get_json(silent=True) or {}
+        ssid = (data.get("ssid") or "").strip()
+        pwd  = data.get("password") or ""
+        if not ssid:
+            return jsonify({"success": False, "message": "SSID required"}), 400
+        return jsonify(result := connect_to_wifi(ssid, pwd)), (200 if result.get("success") else 500)
+    except Exception as exc:
+        logger.error("/api/wifi/connect: %s", exc)
+        return jsonify({"success": False, "message": f"Server error: {exc}"}), 500
+
+
+@app.route("/api/wifi/status")
+def api_wifi_status():
+    """Return current network mode and IPs. No login required."""
+    if not _WIFI_AVAILABLE:
+        return jsonify({"mode": "unknown"})
+    try:
+        return jsonify(get_wifi_status())
+    except Exception as exc:
+        return jsonify({"mode": "unknown", "error": str(exc)}), 500
+
+
+@app.route("/api/wifi/start-hotspot", methods=["POST"])
+def api_wifi_start_hotspot():
+    """Force the device into AP mode. No login required."""
+    if not _WIFI_AVAILABLE:
+        return jsonify({"success": False, "message": "wifi_provision not installed"}), 503
+    try:
+        enable_force_hotspot()
+        result = start_hotspot()
+        return jsonify(result), (200 if result.get("success") else 500)
+    except Exception as exc:
+        logger.error("/api/wifi/start-hotspot: %s", exc)
+        return jsonify({"success": False, "message": f"Server error: {exc}"}), 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────

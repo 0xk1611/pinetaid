@@ -412,7 +412,15 @@ class Database:
                 "anomaly_count": anomalies, "new_devices": new_devs}
 
     def get_device_types(self, subnet: str = None) -> list[dict]:
-        """Classify devices; optional subnet filter."""
+        """
+        Classify all devices and apply any manual overrides from the
+        device_type_overrides.json file.
+
+        Returns each device with three fields for transparency:
+          auto_type     — what the classifier decided
+          override_type — the manual override, or "" if none
+          device_type   — the final value (override wins when set)
+        """
         where = "WHERE d.subnet = ?" if subnet else ""
         params = (subnet,) if subnet else ()
         cur = self._conn.execute(f"""
@@ -427,56 +435,144 @@ class Database:
             GROUP BY d.mac
         """, params)
 
-        # Keyword lists for vendor-based classification
-        IOT_VENDORS    = ["raspberry", "arduino", "esp", "shelly", "tuya",
-                          "sonos", "ring", "nest", "wemo", "philips hue",
-                          "lifx", "broadlink", "tasmota", "ewelink"]
-        MOBILE_VENDORS = ["apple", "samsung", "oneplus", "huawei", "oppo",
-                          "vivo", "xiaomi", "realme", "nothing", "google pixel"]
-        PC_VENDORS     = ["intel", "dell", "hp ", "lenovo", "asus", "acer",
-                          "microsoft", "msi ", "gigabyte", "asrock", "supermicro"]
-        NETWORK_VENDORS= ["cisco", "ubiquiti", "netgear", "tp-link", "d-link",
-                          "mikrotik", "juniper", "aruba", "zyxel", "fortinet"]
+        overrides = self.get_device_type_overrides()
+
+        # ── Network infrastructure vendors ───────────────────────────────────
+        NETWORK_VENDORS = [
+            "cisco", "ubiquiti", "netgear", "tp-link", "tplink", "d-link",
+            "dlink", "zyxel", "mikrotik", "linksys", "unifi", "aruba",
+            "fortinet", "juniper", "ruckus", "tenda", "asus router",
+        ]
+        # ── Vendors that appear on laptop/desktop WiFi adapters and NICs ─────
+        # These are chipset OEM vendors — the device is almost always a PC.
+        PC_VENDORS = [
+            "intel", "dell", "hp ", "hewlett", "lenovo", "asus", "acer",
+            "microsoft", "msi ", "gigabyte", "asrock", "toshiba", "supermicro",
+            "liteon", "lite-on", "azurewave", "realtek", "hon hai", "foxconn",
+            "murata", "qualcomm", "broadcom", "ralink", "mediatek",
+            "rivet networks", "killer", "buffalo", "giga-byte",
+        ]
+        # ── Phone / tablet vendors ────────────────────────────────────────────
+        MOBILE_VENDORS = [
+            "apple", "samsung", "oneplus", "oppo", "vivo", "xiaomi",
+            "realme", "nothing", "google pixel", "motorola", "nokia",
+            "lg elec", "zte", "alcatel", "meizu", "honor",
+        ]
+        # ── Dedicated IoT / embedded vendors ─────────────────────────────────
+        # Intentionally narrow — only add vendors that are ONLY found in IoT.
+        # Do NOT add chip vendors like Qualcomm, Realtek etc. here.
+        IOT_VENDORS = [
+            "raspberry", "espressif", "esp8266", "esp32", "shelly", "tuya",
+            "sonoff", "tasmota", "ewelink", "arduino", "lifx", "broadlink",
+            "wemo", "philips hue", "sengled", "meross", "switchbot",
+            "hikvision", "dahua", "reolink", "wyze", "ring llc",
+        ]
 
         results = []
         for row in cur.fetchall():
             row       = dict(row)
             vendor    = (row["vendor"] or "").lower()
+            mac       = row["mac"]
             arp       = row["arp_count"] or 0
             dns       = row["dns_count"] or 0
             log_total = row["log_total"] or 0
-            # Use packet_count as a proxy when traffic_logs is empty/thin
             total     = log_total if log_total > 0 else row["pkt"]
 
-            # 1. Vendor keyword match (most reliable)
-            if any(k in vendor for k in IOT_VENDORS):
-                dtype = "IoT Device"
-            elif any(k in vendor for k in MOBILE_VENDORS):
-                dtype = "Mobile Device"
-            elif any(k in vendor for k in PC_VENDORS):
-                dtype = "PC / Laptop"
-            elif any(k in vendor for k in NETWORK_VENDORS):
-                dtype = "Network Device"
+            # ── Priority A: network infrastructure ───────────────────────────
+            if any(k in vendor for k in NETWORK_VENDORS):
+                auto = "Network Device"
 
-            # 2. Behaviour heuristics (no vendor match) — T6: never return Unknown
-            elif total == 0:
-                dtype = "IoT Device"        # T6: unseen traffic → assume IoT/quiet
-            elif arp > 0 and log_total > 0 and arp / log_total > 0.5:
-                dtype = "Windows PC"        # Windows probes ARP constantly
-            elif dns > 0 and log_total > 0 and dns / log_total > 0.4:
-                dtype = "Mobile Device"     # phones resolve DNS frequently
-            elif total > 100:
-                dtype = "PC / Server"       # high volume = computer or server
-            elif total < 15:
-                dtype = "IoT Device"        # very low traffic = embedded device
+            # ── Priority B: PC / laptop WiFi adapter vendors ──────────────────
+            elif any(k in vendor for k in PC_VENDORS):
+                auto = "PC / Laptop"
+
+            # ── Priority C: mobile / phone vendors ────────────────────────────
+            elif any(k in vendor for k in MOBILE_VENDORS):
+                auto = "Mobile Device"
+
+            # ── Priority D: dedicated IoT vendors ────────────────────────────
+            elif any(k in vendor for k in IOT_VENDORS):
+                auto = "IoT Device"
+
+            # ── Priority E: randomised MAC bit → most likely mobile/VM ───────
+            elif mac:
+                try:
+                    first_byte = int(mac.replace("-", ":").split(":")[0], 16)
+                    if first_byte & 0x02:
+                        auto = "Mobile Device"
+                    else:
+                        auto = None   # fall through to behaviour
+                except (ValueError, IndexError):
+                    auto = None
             else:
-                dtype = "Network Device"    # T6: medium ARP traffic → likely a switch/AP
+                auto = None
+
+            # ── Priority F: traffic behaviour (only when vendor gives no hint) ─
+            if auto is None:
+                if total == 0:
+                    # No traffic at all — insufficient evidence; do NOT default to IoT
+                    auto = "Unknown Device"
+                elif arp > 0 and log_total > 0 and arp / log_total > 0.6:
+                    auto = "PC / Laptop"    # ARP-heavy = Windows or Linux host
+                elif dns > 0 and log_total > 0 and dns / log_total > 0.4:
+                    auto = "Mobile Device"  # DNS-heavy = phone
+                elif total > 200:
+                    auto = "PC / Laptop"    # high volume = workstation or server
+                else:
+                    auto = "Unknown Device" # not enough evidence — don't guess IoT
+
+            override = overrides.get(mac.upper(), "")
+            final    = override if override else auto
 
             results.append({
-                "mac": row["mac"], "ip": row["ip"],
-                "vendor": row["vendor"], "device_type": dtype,
+                "mac":           mac,
+                "ip":            row["ip"],
+                "vendor":        row["vendor"],
+                "auto_type":     auto,
+                "override_type": override,
+                "device_type":   final,
             })
         return results
+
+    def get_device_type_overrides(self) -> dict:
+        """
+        Load manual device-type overrides from data/device_type_overrides.json.
+        Keys are upper-cased MAC addresses; values are the override type string.
+        Returns an empty dict if the file does not exist or cannot be read.
+        """
+        import json as _json, os as _os
+        path = _os.path.join(_os.path.dirname(__file__), "data",
+                             "device_type_overrides.json")
+        try:
+            with open(path) as fh:
+                raw = _json.load(fh)
+            # Normalise all MACs to upper-case for consistent lookup
+            return {k.upper(): v for k, v in raw.items()}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            logger.warning("Could not load device_type_overrides.json: %s", exc)
+            return {}
+
+    def set_device_type_override(self, mac: str, device_type: str) -> None:
+        """
+        Write or update a manual override for a MAC address.
+        Pass device_type="" to remove an existing override.
+        Changes are persisted to data/device_type_overrides.json immediately.
+        """
+        import json as _json, os as _os
+        path = _os.path.join(_os.path.dirname(__file__), "data",
+                             "device_type_overrides.json")
+        _os.makedirs(_os.path.dirname(path), exist_ok=True)
+        overrides = self.get_device_type_overrides()
+        mac_up = mac.upper()
+        if device_type:
+            overrides[mac_up] = device_type
+        else:
+            overrides.pop(mac_up, None)
+        with open(path, "w") as fh:
+            _json.dump(overrides, fh, indent=2)
+        logger.info("Device type override saved: %s → %s", mac_up, device_type or "(removed)")
 
     def delete_by_subnet(self, subnet: str) -> dict:
         """
@@ -529,97 +625,34 @@ class Database:
     def get_anomaly_history(self, limit: int = 100,
                             subnet: str = None) -> list[dict]:
         """
-        Return resolved anomaly history rows only (resolved_at IS NOT NULL).
-        Active anomalies are in ai_results — not here.
-        Joins to devices to get the current IP for each MAC.
+        Return ai_history rows, newest first (last_updated DESC).
+
+        subnet -- when provided, restricts to MACs in that subnet.
+        Returns dicts with all ai_history columns.
+        resolved_at is None for active anomalies.
         """
         if subnet:
             cur = self._conn.execute("""
-                SELECT h.id, h.mac,
-                       COALESCE(d.ip, h.ip, '') AS ip,
-                       COALESCE(d.vendor, h.vendor, '') AS vendor,
-                       h.device_type,
-                       h.score, h.severity, h.reason,
+                SELECT h.id, h.mac, h.ip, h.vendor, h.device_type,
+                       h.score, h.severity, h.confidence, h.reason,
                        h.first_detected, h.last_updated, h.resolved_at
                 FROM ai_history h
-                LEFT JOIN devices d ON h.mac = d.mac
-                WHERE h.resolved_at IS NOT NULL
-                  AND h.mac IN (
-                      SELECT mac FROM devices WHERE subnet = ?
-                  )
+                WHERE h.mac IN (
+                    SELECT mac FROM devices WHERE subnet = ?
+                )
                 ORDER BY h.last_updated DESC
                 LIMIT ?
             """, (subnet, limit))
         else:
             cur = self._conn.execute("""
-                SELECT h.id, h.mac,
-                       COALESCE(d.ip, h.ip, '') AS ip,
-                       COALESCE(d.vendor, h.vendor, '') AS vendor,
-                       h.device_type,
-                       h.score, h.severity, h.reason,
-                       h.first_detected, h.last_updated, h.resolved_at
-                FROM ai_history h
-                LEFT JOIN devices d ON h.mac = d.mac
-                WHERE h.resolved_at IS NOT NULL
-                ORDER BY h.last_updated DESC
+                SELECT id, mac, ip, vendor, device_type,
+                       score, severity, confidence, reason,
+                       first_detected, last_updated, resolved_at
+                FROM ai_history
+                ORDER BY last_updated DESC
                 LIMIT ?
             """, (limit,))
         return [dict(row) for row in cur.fetchall()]
-
-    def delete_anomaly(self, mac: str) -> None:
-        """Remove all active anomaly rows for a MAC from ai_results."""
-        with _write_lock:
-            self._conn.execute(
-                "DELETE FROM ai_results WHERE mac = ? AND result = 'anomaly'",
-                (mac,),
-            )
-            self._conn.commit()
-
-    def save_ai_history(self, mac: str, ip: str = "", vendor: str = "",
-                        device_type: str = "", score: float = 0.0,
-                        severity: str = "Low", reason: str = "") -> None:
-        """
-        Upsert a staging history row for an active anomaly.
-        resolved_at stays NULL while the device is still flagged.
-        When the device clears, resolve_history() sets resolved_at,
-        which is when the row becomes visible in the History tab.
-        """
-        with _write_lock:
-            existing = self._conn.execute(
-                "SELECT id FROM ai_history WHERE mac = ? AND resolved_at IS NULL LIMIT 1",
-                (mac,),
-            ).fetchone()
-            if existing:
-                self._conn.execute("""
-                    UPDATE ai_history
-                    SET ip=?, vendor=?, device_type=?, score=?,
-                        severity=?, reason=?, last_updated=datetime('now')
-                    WHERE id=?
-                """, (ip, vendor, device_type, score, severity, reason, existing["id"]))
-            else:
-                self._conn.execute("""
-                    INSERT INTO ai_history
-                        (mac, ip, vendor, device_type, score, severity, reason,
-                         first_detected, last_updated, resolved_at)
-                    VALUES (?,?,?,?,?,?,?,datetime('now'),datetime('now'),NULL)
-                """, (mac, ip, vendor, device_type, score, severity, reason))
-            self._conn.commit()
-
-    def resolve_history(self, macs: list) -> None:
-        """
-        Mark history rows resolved for devices that are no longer anomalous.
-        Once resolved_at is set, the row becomes visible in the History tab.
-        """
-        if not macs:
-            return
-        ph = ",".join("?" * len(macs))
-        with _write_lock:
-            self._conn.execute(
-                f"UPDATE ai_history SET resolved_at=datetime('now')"
-                f" WHERE mac IN ({ph}) AND resolved_at IS NULL",
-                list(macs),
-            )
-            self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()

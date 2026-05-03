@@ -197,23 +197,24 @@ def _run_rules(db: Database) -> list[dict]:
     for mac, data in flags.items():
         reason_str = "; ".join(data["reasons"])
 
-        # Write to the active anomaly table
+        # Save to ai_results (dedup logic already in save_ai_result)
         db.save_ai_result(mac=mac, model="RuleEngine", result="anomaly",
                           score=data["score"], reason=reason_str,
                           severity=data["severity"])
 
-        # Stage a history row (resolved_at = NULL while still active).
-        # clear_resolved_anomalies() will set resolved_at when the device clears,
-        # which is the only moment the row becomes visible in the History tab.
+        # Upsert into ai_history — one row per MAC, updated in-place so
+        # the history table never accumulates duplicates per analysis run.
+        # Fetch current IP/vendor from the devices table for display.
         dev = db.get_device(mac) or {}
-        db.save_ai_history(
-            mac=mac,
-            ip=dev.get("ip") or "",
-            vendor=dev.get("vendor") or "",
-            device_type="",
-            score=data["score"],
-            severity=data["severity"],
-            reason=reason_str,
+        db.upsert_ai_history(
+            mac            = mac,
+            ip             = dev.get("ip", ""),
+            vendor         = dev.get("vendor", ""),
+            score          = data["score"],
+            severity       = data["severity"],
+            reason         = reason_str,
+            status         = "active",
+            resolved_reason = "",   # cleared when re-activating
         )
 
         flagged_macs.add(mac)
@@ -222,29 +223,14 @@ def _run_rules(db: Database) -> list[dict]:
                         "severity": data["severity"]})
         logger.warning(f"[{data['severity']}] {mac}: {reason_str}")
 
-    # Resolve any device that was anomalous last run but is clean this run.
-    # This deletes it from ai_results and sets resolved_at in ai_history.
-    clear_resolved_anomalies(db, flagged_macs)
+    # Mark any previously-active anomaly as resolved if it was not flagged
+    # in this run — this is how AI History gets its "resolved_reason" values.
+    resolved_count = db.mark_resolved_anomalies(flagged_macs)
+    if resolved_count:
+        logger.info(f"Rule engine: {resolved_count} previously-active anomaly(ies) resolved.")
 
     logger.info(f"Rule engine: {len(results)} device(s) flagged.")
     return results
-
-
-def clear_resolved_anomalies(db: Database, flagged_macs: set) -> None:
-    """
-    Clean up devices that are no longer anomalous.
-    Deletes from ai_results and sets resolved_at in ai_history,
-    which is the moment they move from Active to History.
-    """
-    current_active = {r["mac"] for r in db.get_anomalies(limit=10000)}
-    to_resolve = current_active - flagged_macs
-    if not to_resolve:
-        return
-    for mac in to_resolve:
-        db.delete_anomaly(mac)
-    db.resolve_history(list(to_resolve))
-    logger.info("Resolved %d anomaly(ies) — moved to history: %s",
-                len(to_resolve), to_resolve)
 
 
 # ─── Isolation Forest (secondary, needs ≥ 4 devices) ────────────────────────
